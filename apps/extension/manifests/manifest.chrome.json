@@ -1,0 +1,11 @@
+{
+  "minimum_chrome_version": "120",
+  "background": {
+    "service_worker": "worker.js",
+    "type": "module"
+  },
+  "permissions": ["userScripts", "sidePanel", "offscreen", "clipboardWrite", "notifications"],
+  "side_panel": {
+    "default_path": "panel/index.html"
+  }
+}

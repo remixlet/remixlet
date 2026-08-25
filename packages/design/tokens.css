@@ -1,0 +1,106 @@
+/* Remixlet design tokens — the single source of the design language, shared
+   by the marketing website and the extension. Two layers:
+
+   1. Brand tokens (:root / .dark): the palette, rings, radii, and font stacks
+      the website's bespoke CSS uses directly. Dark is the canonical brand
+      (the website pins .dark on <html>); light is authored for the extension,
+      which follows the OS scheme.
+   2. The shadcn mapping (@theme inline): brand tokens projected onto shadcn's
+      token names, so every shadcn/Base UI component in either app renders in
+      the brand automatically.
+
+   Consumers @import "@remixlet/design/tokens.css" from their Tailwind v4
+   entry stylesheet. This file carries tokens only — no resets, no component
+   styles, no font-face declarations (each app loads the woff2 payloads its
+   own way). */
+
+:root {
+  /* light — derived from the dark brand: same warmth, inverted values */
+  --canvas: #f4f3ee;
+  --surface: #fcfbf8;
+  --surface-2: #eae9e1;
+  --ink: #22271f;
+  --muted: #5f6a62;
+  --line: rgba(34, 39, 31, 0.16);
+  --line-soft: rgba(34, 39, 31, 0.09);
+  --accent: #1f8f63;
+  --accent-deep: #cfe9db;
+  --accent-ink: #f2fbf6;
+  --signal: #a56b1f;
+  --knob: #fff;
+  --destructive: oklch(0.577 0.245 27.325);
+
+  --ring-1: 0 0 0 1px rgba(34, 39, 31, 0.14);
+  --ring-inner: 0 0 0 1px rgba(34, 39, 31, 0.08);
+  --ring-soft:
+    0 1px 2px rgba(20, 24, 20, 0.08),
+    0 14px 36px -20px rgba(20, 24, 20, 0.28);
+
+  /* shape + type are scheme-independent */
+  --r-frame: 12px;
+  --r-inner: 8px;
+
+  --sans: "Space Grotesk Variable", "Space Grotesk", system-ui, sans-serif;
+  --mono: "IBM Plex Mono", ui-monospace, "SF Mono", Menlo, monospace;
+}
+
+.dark {
+  /* the canonical brand palette (lifted verbatim from the website) */
+  --canvas: #131315;
+  --surface: #1d211f;
+  --surface-2: #262b28;
+  --ink: #e9e6db;
+  --muted: #a5aea4;
+  --line: rgba(233, 230, 219, 0.16);
+  --line-soft: rgba(233, 230, 219, 0.09);
+  --accent: #3ec98f;
+  --accent-deep: #174936;
+  --accent-ink: #0b241a;
+  --signal: #d29a52;
+  --knob: #e9e6db;
+  --destructive: oklch(0.704 0.191 22.216);
+
+  --ring-1: 0 0 0 1px rgba(233, 230, 219, 0.14);
+  --ring-inner: 0 0 0 1px rgba(233, 230, 219, 0.09);
+  --ring-soft:
+    0 1px 2px rgba(0, 0, 0, 0.35),
+    0 14px 36px -20px rgba(0, 0, 0, 0.6);
+}
+
+/* shadcn token names, mapped straight onto the brand palette. `--muted`
+   deliberately stays the brand's text color — shadcn's muted-surface meaning
+   lives only inside --color-muted here. */
+@theme inline {
+  --font-sans: var(--sans);
+  --font-heading: var(--sans);
+  --font-mono: var(--mono);
+  --color-background: var(--canvas);
+  --color-foreground: var(--ink);
+  --color-card: var(--surface);
+  --color-card-foreground: var(--ink);
+  /* A popover must not sit on --surface-2: shadcn highlights the hovered item
+     in a menu, select, or combobox with --color-accent, which is --surface-2,
+     so the highlight would be invisible against its own panel. Popovers get
+     the card surface and lift off the page with their ring and shadow. */
+  --color-popover: var(--surface);
+  --color-popover-foreground: var(--ink);
+  --color-primary: var(--accent);
+  --color-primary-foreground: var(--accent-ink);
+  --color-secondary: var(--surface-2);
+  --color-secondary-foreground: var(--ink);
+  --color-muted: var(--surface);
+  --color-muted-foreground: var(--muted);
+  --color-accent: var(--surface-2);
+  --color-accent-foreground: var(--ink);
+  --color-destructive: var(--destructive);
+  --color-border: var(--line);
+  --color-input: var(--line);
+  --color-ring: var(--accent);
+  --radius-sm: 6px;
+  --radius-md: var(--r-inner);
+  --radius-lg: 10px;
+  --radius-xl: var(--r-frame);
+  --radius-2xl: 16px;
+  --radius-3xl: 20px;
+  --radius-4xl: 24px;
+}

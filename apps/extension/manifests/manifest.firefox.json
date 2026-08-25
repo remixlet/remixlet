@@ -1,0 +1,23 @@
+{
+  "background": {
+    "scripts": ["worker.js"],
+    "type": "module"
+  },
+  "permissions": [
+    "notifications",
+    "webRequestBlocking",
+    "webRequestFilterResponse"
+  ],
+  "optional_permissions": ["userScripts"],
+  "sidebar_action": {
+    "default_title": "Remixlet",
+    "default_panel": "panel/index.html",
+    "open_at_install": false
+  },
+  "browser_specific_settings": {
+    "gecko": {
+      "id": "extension@remixlet.com",
+      "strict_min_version": "136.0"
+    }
+  }
+}

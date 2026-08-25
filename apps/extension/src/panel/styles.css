@@ -1,0 +1,226 @@
+/* Remixlet design system: latest shadcn (Base UI primitives), base-nova
+   preset, with the brand tokens shared with the marketing website — see
+   packages/design/tokens.css. Dark mode is class-based (.dark on <html>),
+   toggled from prefers-color-scheme in each page entry (src/ui/theme.ts). */
+
+/* Space Grotesk + IBM Plex Mono are loaded via fonts.css (copied verbatim
+   from fontsource next to their woff2 files at build time) — an @import here
+   would leave url()s pointing outside the packed extension. */
+@import "tailwindcss";
+@import "tw-animate-css";
+@import "shadcn/tailwind.css";
+@import "@remixlet/design/tokens.css";
+
+@source "..";
+
+@custom-variant dark (&:is(.dark *));
+
+/* Syntax colors for the script-approval preview (shiki's css-variables theme,
+   src/panel/script-code.tsx). Everything maps onto brand tokens, so dark mode
+   follows the .dark palette with no extra rules. */
+:root {
+  --shiki-foreground: var(--ink);
+  --shiki-token-comment: var(--muted);
+  --shiki-token-keyword: var(--accent);
+  --shiki-token-function: var(--accent);
+  --shiki-token-string: var(--signal);
+  --shiki-token-string-expression: var(--signal);
+  /* "constant" catches every const-declared identifier, not just literals —
+     the default ink keeps the preview from drowning in accent color. */
+  --shiki-token-constant: var(--ink);
+  --shiki-token-parameter: var(--ink);
+  --shiki-token-punctuation: var(--muted);
+  --shiki-token-link: var(--accent);
+}
+
+/* Categorical series colors for the dashboard's Tremor charts
+   (src/components/charts/). Slot ORDER is the colorblind-safety mechanism —
+   adjacent pairs were validated per mode (CVD ΔE ≥ 8, normal-vision ≥ 15);
+   reordering or inserting needs re-validation, not taste. The dark set is the
+   same eight hues re-stepped for the dark surface, not a separate palette. */
+:root {
+  --chart-1: #2a78d6;
+  --chart-2: #eb6834;
+  --chart-3: #1baf7a;
+  --chart-4: #eda100;
+  --chart-5: #e87ba4;
+  --chart-6: #008300;
+  --chart-7: #4a3aa7;
+  --chart-8: #e34948;
+}
+
+.dark {
+  --chart-1: #3987e5;
+  --chart-2: #d95926;
+  --chart-3: #199e70;
+  --chart-4: #c98500;
+  --chart-5: #d55181;
+  --chart-6: #008300;
+  --chart-7: #9085e9;
+  --chart-8: #e66767;
+}
+
+@layer base {
+  * {
+    @apply border-border outline-ring/50;
+    }
+  body {
+    @apply bg-background text-foreground;
+    }
+  html {
+    @apply font-sans;
+    }
+}
+
+/* Chat transcript bubbles. The class shape (`msg <kind>`, nothing else) is a
+   contract with the conversation test suite, which reconstructs the
+   transcript from `#chat .msg` classNames — style them here, not inline. */
+@layer components {
+  .msg {
+    @apply max-w-full text-sm whitespace-pre-wrap [overflow-wrap:anywhere];
+  }
+  /* Bubbles carry their own vertical margin on top of the transcript's base
+     gap: the activity rows between them are a dense list, so the space that
+     separates one exchange from the next has to come from the bubbles. Bubble
+     geometry (accent-deep user / surface-2 assistant, one squared corner
+     pointing at the sender) comes from the sidebar-composer design handoff. */
+  .msg.user {
+    @apply my-3 max-w-[82%] self-end rounded-[12px_12px_3px_12px] bg-[var(--accent-deep)] px-3 py-[9px] text-[13px] leading-[18px] text-foreground;
+  }
+  .msg.assistant {
+    /* Assistant replies render as markdown (components/ui/response.tsx), so
+       block spacing comes from the elements below — not preserved newlines. */
+    @apply my-3 max-w-[88%] self-start rounded-[12px_12px_12px_3px] bg-secondary px-3 py-[9px] text-[13px] leading-[18px] whitespace-normal;
+  }
+  .msg.assistant > * + * {
+    @apply mt-2;
+  }
+  .msg.assistant :is(h1, h2, h3, h4, h5, h6) {
+    @apply text-sm font-semibold;
+  }
+  .msg.assistant strong {
+    @apply font-semibold;
+  }
+  .msg.assistant ul {
+    @apply list-disc pl-5;
+  }
+  .msg.assistant ol {
+    @apply list-decimal pl-5;
+  }
+  .msg.assistant li + li {
+    @apply mt-1;
+  }
+  .msg.assistant a {
+    @apply underline underline-offset-2 hover:text-primary;
+  }
+  .msg.assistant code {
+    @apply rounded bg-muted px-1 py-0.5 font-mono text-[0.85em];
+  }
+  .msg.assistant pre {
+    @apply overflow-x-auto rounded-lg bg-muted p-2.5 font-mono text-xs whitespace-pre;
+  }
+  .msg.assistant pre code {
+    @apply bg-transparent p-0;
+  }
+  .msg.assistant blockquote {
+    @apply border-l-2 pl-3 text-muted-foreground;
+  }
+  .msg.assistant table {
+    @apply block max-w-full overflow-x-auto text-xs;
+  }
+  .msg.assistant :is(th, td) {
+    @apply border px-2 py-1 text-left;
+  }
+  .msg.assistant hr {
+    @apply my-3;
+  }
+  .msg.tool {
+    @apply self-stretch pl-1 text-xs leading-[15px] text-muted-foreground;
+  }
+  .msg.error {
+    @apply my-3 self-stretch rounded-lg bg-destructive/10 px-2.5 py-1.5 text-destructive;
+  }
+
+  /* The control center's chat detail page (ui/control-center/chat-transcript.tsx):
+     the stored conversation in the same `msg <kind>` vocabulary as the panel —
+     markdown styling inherits from .msg.assistant above — but at the page-scale
+     bubble geometry from the chat-detail design handoff. User bubbles go full
+     accent here (the panel's accent-deep tint reads washed out on the canvas). */
+  #chat-transcript .msg.user {
+    @apply my-0 max-w-[80%] rounded-[14px_14px_4px_14px] bg-[var(--accent)] px-3.5 py-2.5 text-[13.5px] leading-[1.55] text-[var(--accent-ink)];
+  }
+  #chat-transcript .msg.assistant {
+    @apply my-0 max-w-[86%] rounded-[14px_14px_14px_4px] bg-[var(--surface)] px-3.5 py-2.5 text-[13.5px] leading-[1.6] shadow-[var(--ring-1)];
+  }
+  #chat-transcript .msg.tool {
+    @apply pl-0 text-[12.5px] leading-normal;
+  }
+  /* Error rows read as destructive text in the assistant's row geometry —
+     no tinted bubble on this page. */
+  #chat-transcript .msg.error {
+    @apply my-0 max-w-[86%] self-start bg-transparent px-0 py-0 text-[13.5px] leading-[1.6] text-destructive;
+  }
+
+  /* A remixlet's README rendered as a document (control center's README tab).
+     Same element vocabulary as .msg.assistant, sized for a full page rather
+     than a chat bubble: a readable measure and a real heading hierarchy. */
+  .readme-doc {
+    @apply max-w-2xl py-1 text-sm leading-relaxed;
+  }
+  .readme-doc > * + * {
+    @apply mt-3;
+  }
+  /* The first element (usually the INTENT eyebrow) sits at the card's own
+     padding — section top-margins are for separating sections, not for
+     padding the sheet. */
+  .readme-doc > :first-child {
+    @apply mt-0;
+  }
+  .readme-doc h1 {
+    @apply text-lg font-semibold tracking-tight;
+  }
+  /* Section headings as mono eyebrows (INTENT / BEHAVIOR / …), so the doc
+     sheet's structure reads at a glance without competing with the body. */
+  .readme-doc h2 {
+    @apply mt-5 font-mono text-[10.5px] font-semibold tracking-[0.1em] text-primary uppercase;
+  }
+  .readme-doc :is(h3, h4, h5, h6) {
+    @apply mt-4 text-sm font-semibold;
+  }
+  .readme-doc strong {
+    @apply font-semibold;
+  }
+  .readme-doc ul {
+    @apply list-disc pl-5;
+  }
+  .readme-doc ol {
+    @apply list-decimal pl-5;
+  }
+  .readme-doc li + li {
+    @apply mt-1;
+  }
+  .readme-doc a {
+    @apply underline underline-offset-2 hover:text-primary;
+  }
+  .readme-doc code {
+    @apply rounded bg-muted px-1 py-0.5 font-mono text-[0.85em];
+  }
+  .readme-doc pre {
+    @apply overflow-x-auto rounded-lg bg-muted p-2.5 font-mono text-xs whitespace-pre;
+  }
+  .readme-doc pre code {
+    @apply bg-transparent p-0;
+  }
+  .readme-doc blockquote {
+    @apply border-l-2 pl-3 text-muted-foreground;
+  }
+  .readme-doc table {
+    @apply block max-w-full overflow-x-auto text-xs;
+  }
+  .readme-doc :is(th, td) {
+    @apply border px-2 py-1 text-left;
+  }
+  .readme-doc hr {
+    @apply my-4;
+  }
+}

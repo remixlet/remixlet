@@ -1,0 +1,17 @@
+{
+  "name": "remixlet",
+  "version": "0.0.1",
+  "private": true,
+  "license": "AGPL-3.0-only",
+  "description": "Remixlet monorepo: browser extension and marketing website.",
+  "type": "module",
+  "packageManager": "pnpm@10.13.1",
+  "scripts": {
+    "build": "pnpm --filter remixlet-extension build",
+    "build:firefox": "pnpm --filter remixlet-extension build:firefox",
+    "build:safari": "pnpm --filter remixlet-extension build:safari",
+    "lint": "pnpm --filter remixlet-extension lint",
+    "typecheck": "pnpm --filter remixlet-extension typecheck",
+    "watch": "pnpm --filter remixlet-extension watch"
+  }
+}

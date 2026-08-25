@@ -1,0 +1,82 @@
+version: "3"
+
+tasks:
+  setup:
+    desc: Install workspace dependencies
+    cmds:
+      - pnpm install
+
+  build:
+    desc: Build the Chrome extension into apps/extension/dist/chrome/
+    dir: apps/extension
+    cmds:
+      - pnpm build
+
+  build:firefox:
+    desc: Build the Firefox extension into apps/extension/dist/firefox/
+    dir: apps/extension
+    cmds:
+      - pnpm build:firefox
+
+  build:safari:
+    desc: Build the limited Safari extension into apps/extension/dist/safari/
+    dir: apps/extension
+    cmds:
+      - pnpm build:safari
+
+  watch:
+    desc: Rebuild the Chrome target on change + auto-reload the loaded extension (dev-reload server on :43117)
+    dir: apps/extension
+    cmds:
+      - pnpm watch
+
+  typecheck:
+    desc: Typecheck the extension
+    dir: apps/extension
+    cmds:
+      - pnpm typecheck
+
+  lint:
+    desc: Enforce source boundaries and run lint contract fixtures
+    dir: apps/extension
+    cmds:
+      - pnpm lint
+
+  test:
+    desc: Run the shipped platform contract checks (see TESTING.md)
+    cmds:
+      - task: test:capabilities
+      - task: test:user-scripts-gate
+      - task: test:chrome
+      - task: test:firefox
+      - task: test:safari
+
+  test:capabilities:
+    desc: Every cross-browser capability has target-specific reason and enforcement contracts
+    dir: apps/extension
+    cmds:
+      - pnpm test:capabilities
+
+  test:user-scripts-gate:
+    desc: Which unlock Chrome asks for (Developer mode vs toggle), and that a revoked script lane stops reporting itself as available
+    dir: apps/extension
+    cmds:
+      - pnpm test:user-scripts-gate
+
+  test:chrome:
+    desc: Chrome manifest and platform capability-gate contracts
+    dir: apps/extension
+    cmds:
+      - pnpm test:chrome
+
+  test:firefox:
+    desc: Firefox manifest and platform-backend contracts
+    dir: apps/extension
+    cmds:
+      - pnpm test:firefox
+
+  test:safari:
+    desc: Limited Safari target and honest capability-gating contracts
+    dir: apps/extension
+    cmds:
+      - pnpm test:safari

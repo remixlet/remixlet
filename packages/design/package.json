@@ -1,0 +1,9 @@
+{
+  "name": "@remixlet/design",
+  "version": "0.0.1",
+  "private": true,
+  "description": "Shared Remixlet design tokens: brand palette plus the shadcn theme mapping.",
+  "exports": {
+    "./tokens.css": "./tokens.css"
+  }
+}
