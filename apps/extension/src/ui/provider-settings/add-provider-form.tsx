@@ -148,6 +148,22 @@ export function AddProviderForm({
     connectCodex();
   });
 
+  // The page-content-to-provider disclosure, stated in-product before the
+  // consenting click — proceeding past this sentence (Connect, or the ChatGPT
+  // sign-in) is the affirmative consent (wiki/ops/chrome-store-submission.md §2.2).
+  const disclosure = (
+    <p className="max-w-prose text-sm text-muted-foreground">
+      When you chat, Remixlet sends your message and content from the page you're working on — text, structure, and
+      sometimes a screenshot — to{" "}
+      {draft.kind === "codex"
+        ? "OpenAI using your ChatGPT account"
+        : draft.kind === "remixlet"
+          ? "the endpoint you entered"
+          : `${PROVIDER_DEFAULTS[draft.kind].label} using your key`}
+      . Nothing is sent anywhere else.
+    </p>
+  );
+
   const credentialStep =
     draft.kind === "codex" ? (
       <div
@@ -392,6 +408,7 @@ export function AddProviderForm({
           done={credentialsReady}
           last={draft.kind === "codex" || !credentialsReady}
         >
+          {draft.kind === "codex" && disclosure}
           {credentialStep}
           {/* The ChatGPT route is fully determined by the sign-in: name, endpoint
               and model list all come from the provider, so there is nothing to tune —
@@ -408,6 +425,7 @@ export function AddProviderForm({
           done={false}
           last
         >
+          {disclosure}
           <Button
             id="connect-provider"
             type="button"

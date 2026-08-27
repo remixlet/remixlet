@@ -7,7 +7,6 @@
     "scripting",
     "storage",
     "unlimitedStorage",
-    "declarativeNetRequest",
     "webRequest",
     "webNavigation",
     "tabs",

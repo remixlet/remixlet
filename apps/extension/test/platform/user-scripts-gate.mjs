@@ -53,7 +53,7 @@ function baseApi(extras) {
   return {
     runtime: {
       id: "user-scripts-gate",
-      getManifest: () => ({ permissions: ["userScripts", "declarativeNetRequest"], optional_permissions: [] }),
+      getManifest: () => ({ permissions: ["userScripts", "declarativeNetRequestWithHostAccess"], optional_permissions: [] }),
       getURL: (value) => `chrome-extension://user-scripts-gate/${value}`,
     },
     permissions: { contains: async () => true, request: async () => false },

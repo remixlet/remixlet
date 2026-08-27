@@ -11,6 +11,7 @@
     "build:firefox": "pnpm --filter remixlet-extension build:firefox",
     "build:safari": "pnpm --filter remixlet-extension build:safari",
     "lint": "pnpm --filter remixlet-extension lint",
+    "package": "pnpm --filter remixlet-extension package",
     "typecheck": "pnpm --filter remixlet-extension typecheck",
     "watch": "pnpm --filter remixlet-extension watch"
   }

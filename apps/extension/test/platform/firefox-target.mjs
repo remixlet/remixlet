@@ -32,6 +32,10 @@ assert(manifest.sidebar_action?.default_panel === "panel/index.html", "shared pa
 assert(manifest.side_panel === undefined, "Chrome side_panel key is absent");
 assert(optionalPermissions.has("userScripts"), "Firefox requests userScripts as an optional permission");
 assert(!permissions.has("userScripts"), "Firefox does not install-grant userScripts");
+assert(
+  permissions.has("declarativeNetRequest") && !permissions.has("declarativeNetRequestWithHostAccess"),
+  "Firefox keeps plain declarativeNetRequest: its host permissions are optional-by-default, so the WithHostAccess variant would leave netrules and the OAuth redirect inert until the user opts in per site",
+);
 assert(!permissions.has("clipboardWrite"), "unsupported clipboard authority is absent");
 assert(permissions.has("webRequestBlocking"), "response stream interception has its Firefox permission");
 assert(permissions.has("webRequestFilterResponse"), "MV3 response filtering has its Firefox permission");

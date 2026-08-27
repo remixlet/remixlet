@@ -27,6 +27,15 @@ function assert(condition, message) {
 assert(manifest.permissions.includes("userScripts"), "Chrome declares its install-time userScripts permission");
 assert(manifest.permissions.includes("sidePanel"), "Chrome declares sidePanel");
 assert(
+  manifest.permissions.includes("declarativeNetRequestWithHostAccess") &&
+    !manifest.permissions.includes("declarativeNetRequest"),
+  'Chrome uses the WithHostAccess DNR variant — same capabilities under <all_urls>, without the standalone "Block content on any page" install warning (wiki/ops/chrome-store-submission.md §3.1)',
+);
+assert(
+  manifest.minimum_chrome_version === "138",
+  "Chrome floor is 138: userScripts.execute needs 135+, and 138 has the per-extension toggle the onboarding points at (wiki/ops/chrome-store-submission.md §3.2)",
+);
+assert(
   !(manifest.optional_permissions ?? []).includes("pageCapture"),
   "pageCapture stays out of the manifest (MHTML slice dropped 2026-08-20 — see wiki/decisions/drop-mhtml-pagecapture.md)",
 );

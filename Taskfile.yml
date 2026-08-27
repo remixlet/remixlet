@@ -24,6 +24,12 @@ tasks:
     cmds:
       - pnpm build:safari
 
+  package:
+    desc: Build, zip, and validate the Chrome Web Store artifact (→ apps/extension/dist/remixlet-chrome-<version>.zip); load the zip's contents fresh before submitting
+    dir: apps/extension
+    cmds:
+      - pnpm package
+
   watch:
     desc: Rebuild the Chrome target on change + auto-reload the loaded extension (dev-reload server on :43117)
     dir: apps/extension

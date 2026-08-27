@@ -4,6 +4,7 @@
     "type": "module"
   },
   "permissions": [
+    "declarativeNetRequest",
     "notifications",
     "webRequestBlocking",
     "webRequestFilterResponse"

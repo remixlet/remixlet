@@ -9,6 +9,7 @@
     "build": "node build.mjs --target=chrome",
     "build:firefox": "node build.mjs --target=firefox",
     "build:safari": "node build.mjs --target=safari",
+    "package": "node tools/package.mjs",
     "test:capabilities": "node test/platform/capability-contract.mjs",
     "test:user-scripts-gate": "node test/platform/user-scripts-gate.mjs",
     "test:chrome": "node test/platform/chrome-target.mjs",
