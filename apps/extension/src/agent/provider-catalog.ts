@@ -109,7 +109,7 @@ export const PROVIDER_CATALOG: readonly ProviderCatalogEntry[] = [
     kind: "codex",
     label: "ChatGPT",
     title: "ChatGPT",
-    description: "Codex models included with a paid ChatGPT plan (Plus, Pro, Team…)",
+    description: "Codex models are included with paid ChatGPT plans.",
     access: "subscription",
     qualifier: "subscription",
     baseUrl: CODEX_API_BASE_URL,

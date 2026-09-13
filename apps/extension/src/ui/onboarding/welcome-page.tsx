@@ -284,7 +284,7 @@ export function WelcomePage() {
             summary={
               modelsDone
                 ? `${catalog.settings.providers.length} provider${catalog.settings.providers.length === 1 ? "" : "s"} connected — its models are ready to pick in chat.`
-                : "Remixlet brings the agent, you bring the model: sign in with a plan you already pay for, or paste an API key. Credentials stay on this device."
+                : "Sign in with ChatGPT or use an API key."
             }
             state={modelsDone ? "done" : pinResolved ? "active" : "locked"}
           >

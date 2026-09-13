@@ -248,13 +248,11 @@ export function useProviderCatalog(): ProviderCatalog {
   }
 
   function beginCodexSignIn(): void {
+    setStatus("");
     setError("");
     void sendToWorker({ kind: "codex.begin" }, "codex.begun").then((reply) => {
       if (!reply.ok) setError(reply.message ?? "ChatGPT sign-in could not start.");
-      else
-        setStatus(
-          "OpenAI opened in a new tab. Confirm the account shown and choose Continue, then return here to connect the provider.",
-        );
+      else void refreshCodexStatus();
     });
   }
 

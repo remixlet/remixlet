@@ -25,7 +25,7 @@ export interface DraftProvider {
 const newDraft = (kind: ProviderKind = "openai"): DraftProvider => ({
   kind,
   name: PROVIDER_DEFAULTS[kind].label,
-  baseUrl: PROVIDER_DEFAULTS[kind].baseUrl,
+  baseUrl: kind === "remixlet" ? "" : PROVIDER_DEFAULTS[kind].baseUrl,
   apiKey: "",
   fallbackModels: "",
 });
@@ -35,13 +35,13 @@ type AccessMethod = "subscription" | "api-key";
 const ACCESS_OPTIONS: { method: AccessMethod; title: string; description: string }[] = [
   {
     method: "subscription",
-    title: "Subscription",
-    description: "Sign in with an AI plan you already pay for",
+    title: "A subscription",
+    description: "Use a paid plan you already have",
   },
   {
     method: "api-key",
-    title: "Bring your own key",
-    description: "Use an API key, or point at any OpenAI-compatible endpoint",
+    title: "API key",
+    description: "Use a provider key or compatible endpoint",
   },
 ];
 
@@ -155,8 +155,8 @@ export function AddProviderForm({
     <p className="max-w-prose text-sm text-muted-foreground">
       {draft.kind === "codex" ? (
         <>
-          Remixlet sends your messages and relevant page content to OpenAI through your ChatGPT account. This may
-          include text, page structure, or a screenshot. Nothing from your pages is sent elsewhere.
+          Chat sends your message and relevant page text, structure, or screenshots to OpenAI. Nothing from your pages
+          goes elsewhere.
         </>
       ) : (
         <>
@@ -180,20 +180,25 @@ export function AddProviderForm({
         )}
       >
         {codexStatus.state !== "signed-out" && (
-          <p
+          <div
             id="codex-status"
             className={cn("text-xs", codexSignedInWithoutCodex ? "text-destructive" : "text-muted-foreground")}
           >
-            {codexStatus.state === "signed-in"
-              ? codexSignedInWithoutCodex
-                ? `Signed in as ${codexStatus.email} — this account is on ChatGPT Free, which doesn't include model access for other apps. Pick another provider.`
-                : busy
-                  ? `Signed in as ${codexStatus.email} — checking the connection and listing your models…`
-                  : `Signed in as ${codexStatus.email} · ${codexStatus.planType}`
-              : codexStatus.state === "pending"
-                ? "OpenAI is waiting for you to confirm the account shown."
-                : null}
-          </p>
+            {codexStatus.state === "signed-in" ? (
+              codexSignedInWithoutCodex ? (
+                `Signed in as ${codexStatus.email} — this account is on ChatGPT Free, which doesn't include model access for other apps. Pick another provider.`
+              ) : busy ? (
+                `Signed in as ${codexStatus.email} — checking the connection and listing your models…`
+              ) : (
+                `Signed in as ${codexStatus.email} · ${codexStatus.planType}`
+              )
+            ) : codexStatus.state === "pending" ? (
+              <>
+                <p className="font-medium text-foreground">Finish signing in</p>
+                <p>Confirm your account in the OpenAI tab, then return here.</p>
+              </>
+            ) : null}
+          </div>
         )}
         {codexStatus.state === "signed-in" ? (
           <div className="flex shrink-0 items-center gap-2">
@@ -210,7 +215,7 @@ export function AddProviderForm({
           </div>
         ) : (
           <Button id="codex-signin" type="button" size="sm" onClick={onBeginCodexSignIn}>
-            {codexStatus.state === "pending" ? "Restart sign-in" : "Continue with ChatGPT"}
+            {codexStatus.state === "pending" ? "Open sign-in again" : "Continue with ChatGPT"}
           </Button>
         )}
       </div>
@@ -239,7 +244,7 @@ export function AddProviderForm({
               placeholder="Leave blank for local endpoints without auth"
             />
           </div>
-          <FieldDescription>Stored locally by the extension and sent only to this endpoint.</FieldDescription>
+          <FieldDescription>API keys stay on this device. This key is sent only to this endpoint.</FieldDescription>
         </Field>
       </FieldGroup>
     ) : (
@@ -271,7 +276,7 @@ export function AddProviderForm({
               .{" "}
             </>
           )}
-          Stored locally by the extension and sent only to this provider.
+          API keys stay on this device. This key is sent only to this provider.
         </FieldDescription>
       </Field>
     );
@@ -324,7 +329,7 @@ export function AddProviderForm({
 
   const steps = (
     <ol className="flex flex-col">
-      <Step number={1} title="How do you want to connect?" done={access !== null} last={access === null}>
+      <Step number={1} title="Choose how to connect" done={access !== null} last={access === null}>
         <div className="grid gap-2 sm:grid-cols-2" role="list" aria-label="Access methods">
           {ACCESS_OPTIONS.map((option) => {
             const selected = access === option.method;
@@ -405,11 +410,6 @@ export function AddProviderForm({
               : draft.kind === "remixlet"
                 ? "Enter the endpoint details"
                 : `Add your ${PROVIDER_DEFAULTS[draft.kind].label} API key`
-          }
-          hint={
-            draft.kind === "codex"
-              ? "Use the Codex models included with your paid ChatGPT plan."
-              : undefined
           }
           done={credentialsReady}
           last={draft.kind === "codex" || !credentialsReady}

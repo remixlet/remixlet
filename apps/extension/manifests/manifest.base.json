@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Remixlet",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Make any site work the way you want. Tell Remixlet what to change, and watch it bend the site to your will.",
   "permissions": [
     "scripting",
