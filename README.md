@@ -2,110 +2,136 @@
 
 Remix any website with a sentence.
 
-Remixlet is a browser extension with an AI coding agent inside it. You open the
-panel on a page and describe what you want: hide this sidebar, add a total row
-to this table, keep this feed chronological. The agent reads the live page,
-writes a remixlet, and turns it on while you watch. A remixlet is a small unit
-of JavaScript, CSS, and network rules that you can read, edit, version, and
-remove. It is stored in your browser, it runs only on the sites it names, and
-it is yours. The web should bend to the person using it, not the other way
-around. Learn more at [remixlet.dev](https://remixlet.dev).
+Remixlet is a browser extension with an AI coding agent inside it. Open the
+side panel on a page and describe what you want, such as hiding a sidebar,
+adding a total row to a table, or keeping a feed chronological. The agent
+inspects the live page, writes a remixlet, activates it, and checks the result.
+
+A remixlet is a small set of JavaScript, CSS, and optional network rules. You
+can inspect its code, ask the agent to revise it, compare versions, roll back,
+disable it, or delete it. It stays in your browser and runs only on the sites
+named in its manifest. Learn more at [remixlet.dev](https://remixlet.dev).
 
 ## How it works
 
-The agent inside the panel is [pi](https://github.com/earendil-works/pi),
-embedded in the extension behind a thin runtime interface. pi has been great
-to build on: its unified LLM API is where remixlet's provider list comes from,
-and conversations are ordinary pi session files (JSONL), kept in the browser's
-own storage. The agent talks directly to a model provider you configure: an
-API key for OpenAI, Anthropic, or Google, or a ChatGPT subscription sign-in.
-There is no server in between, and keys never leave the panel. Before writing anything, the agent captures the page (DOM
-snapshot, optionally a screenshot, the network list, and console output) and
-probes it for the facts the feature depends on. A build that needs data the
-page does not expose is refused rather than faked, and after a build the agent
-verifies its work on the reloaded page; a "Fix this" button hands a failure
-straight back to it.
+The agent uses [pi](https://github.com/earendil-works/pi) behind Remixlet's
+`AgentRuntime` interface. pi supplies the model adapters and session format.
+Remixlet stores conversations as JSONL in the browser's OPFS storage.
 
-A remixlet is written against `rmx.*`, a small published API that will only
-ever gain methods, so a remixlet written today keeps working. Everything beyond
-reading and changing the page is a capability: storage, fetching from a named
-host, network rules, menus, clipboard, notifications, schedules. Each one names
-its scope and does nothing until you click Allow. Remixlets and their full
-history live in a git store inside the browser (OPFS), so every change has a
-diff and rollback is one click. Activation is atomic and survives browser
-restarts. Sharing remixlets between people is deliberately deferred while its
-trust model is worked out.
+You can connect a paid ChatGPT account, use an API key for OpenAI, Anthropic,
+Google, or xAI, or configure an OpenAI-compatible endpoint. The extension
+talks to that provider directly. Remixlet has no proxy server, and provider
+API keys stay in the panel rather than passing through the service worker or
+page bridge.
+
+Before its first write in a turn, the agent must capture the page, inspect any
+existing remixlets for the site, and record whether the request is feasible.
+The Chrome capture contains the DOM, the visible viewport when available, and
+a summary of the page's data endpoints. Focused probes can inspect elements,
+embedded state, and specific network responses. If the necessary data does
+not reach the page, the agent must say so instead of inventing an
+approximation.
+
+After activation, the agent verifies the visible result. Interactive controls
+must work in both directions, and new UI gets a visual review. A failed check
+blocks completion and sends the agent through the remixlet's runtime logs
+before another write.
+
+JavaScript remixlets run in a sandboxed extension page. The sandbox exposes
+neither the network nor a page handle directly. Remixlets reach the document
+through an asynchronous `dom` API policed by an extension-owned page agent.
+The optional `rmx.*` services include storage, fetches to approved hosts,
+response observation, network rules, menus, clipboard writes, notifications, and schedules. A
+remixlet receives one of those services only after the user approves the
+named access in the panel.
+
+Each remixlet has its own git repository in OPFS. Every successful write is a
+tagged version with a diff, and rolling back moves the active version without
+discarding later versions. Activation updates the stored files, runtime,
+styles, and network rules as one operation. If any step fails, the previous
+version remains active. The service worker keeps no state that cannot be
+rebuilt from storage after a restart.
+
+Remixlets carry the version of the `rmx.*` runtime they were built against.
+If an older remixlet does not match the installed runtime, Remixlet holds it
+for repair instead of running it against an incompatible API.
 
 ## Install
 
-Remixlet is not on the extension stores yet. Until it is, build it and load it
-unpacked:
+Install Remixlet from the
+[Chrome Web Store](https://chromewebstore.google.com/detail/remixlet/jidgijjfdffaoobblhnbhcpooojiolkh).
+The same build works in Chrome and Chromium browsers that provide Chrome's
+side panel, including Microsoft Edge, Brave, Dia, and Helium. Arc is not
+supported because its side panel does not display the Remixlet UI. Firefox and
+Safari builds are not released yet.
+
+To build the Chrome target locally:
 
 ```sh
-nix develop          # or `direnv allow` once
+nix develop          # or run `direnv allow` once
 task setup
-task build           # → apps/extension/dist/chrome/
+task build            # unpacked build plus dist/remixlet-chrome-<version>.zip
 ```
 
-Then open `chrome://extensions`, enable Developer mode, choose *Load unpacked*,
-and pick `apps/extension/dist/chrome/`. `task build:firefox` and
-`task build:safari` produce the other targets.
-
-## Browsers
-
-Chrome is the primary target. Firefox has working userScripts, sidebar,
-observation, and OAuth backends. Safari is deliberately limited to CSS and the
-supported subset of network rules, with a popup panel; anything it cannot do is
-shown as disabled, not silently dropped. Automated per-target contracts run in
-CI; live Firefox and signed Safari runs are manual release checks.
+Open `chrome://extensions`, enable Developer mode, choose *Load unpacked*, and
+select `apps/extension/dist/chrome/`. This is the unpacked form of the release
+candidate zip. Run `task watch` after the first load to rebuild on save and
+reload the extension automatically. Run `task build` again before release
+testing because watch builds contain development-only code.
 
 ## Development
 
-TypeScript everywhere; esbuild bundles the extension. `task watch` rebuilds on
-save and reloads the loaded extension by itself, in any Chromium browser,
-through a build-id server on `127.0.0.1:43117` (override: `RMX_RELOAD_PORT`);
-production builds strip the reload client entirely (`src/worker/dev-reload.ts`,
-`build.mjs`). If the loaded copy predates a watch build, reload it manually
-once to pick up the poller.
+The extension is TypeScript and esbuild creates its browser bundles. Use the
+Taskfile from the Nix shell:
 
-`task typecheck`, `task lint`, and `task test` run the checks that ship in this
-repository. Lint enforces two boundaries: only `src/platform/` touches
-`chrome.*`/`browser.*`, and provider keys cannot cross into the worker or the
-bridge. `task test` runs the per-target platform contracts.
-[TESTING.md](TESTING.md) describes the rest of the test system.
+```sh
+task typecheck
+task lint
+task test
+```
 
-| Path | What |
+The public checks include per-target platform contracts and lint-boundary
+fixtures. [TESTING.md](TESTING.md) describes the private real-Chrome harness
+and mock-provider coverage used for releases.
+
+Lint enforces two architectural boundaries. Only
+`apps/extension/src/platform/` may access `chrome.*` or `browser.*`, and
+provider API keys cannot cross into the worker or bridge.
+
+| Path | Contents |
 |---|---|
-| `apps/extension/src/platform/` | The only place `chrome.*`/`browser.*` is touched |
-| `apps/extension/src/agent/` | `AgentRuntime` interface and the embedded pi agent (nothing else imports pi) |
-| `apps/extension/src/store/` | OPFS/git storage for remixlets and captures |
-| `apps/extension/src/worker/` | MV3 service worker: injection, capabilities, schedules |
-| `apps/extension/src/panel/` | Agent host and chat UI |
-| `apps/extension/src/shared/` | Protocol types and schemas |
-| `apps/extension/src/ui/` | Popup, first-run page, manager |
-| `apps/extension/test/` | Shipped contract checks: `test/lint/` and `test/platform/` |
-| `packages/design/` | Design tokens |
+| `apps/extension/src/agent/` | `AgentRuntime`, pi integration, and provider catalog |
+| `apps/extension/src/box/` | Sandboxed JavaScript runtime and mediated page API |
+| `apps/extension/src/bridge/` | Page-world relays for approved network observation |
+| `apps/extension/src/panel/` | Agent host, chat UI, tools, permissions, and verification |
+| `apps/extension/src/platform/` | The only code allowed to touch browser extension APIs |
+| `apps/extension/src/shared/` | Protocol types, schemas, host matching, and shared policy |
+| `apps/extension/src/store/` | OPFS storage for remixlets, git history, captures, and conversations |
+| `apps/extension/src/ui/` | Popup, onboarding, provider settings, and control center |
+| `apps/extension/src/worker/` | MV3 coordination, activation, capabilities, schedules, and lifecycle |
+| `apps/extension/test/lint/` | Architectural boundary fixtures |
+| `apps/extension/test/platform/` | Per-target manifest and capability contracts |
+| `packages/design/` | Shared design tokens and brand assets |
 
 ## Contributions
 
 This repository is an export of a private development repository, so its
-history is one commit per export. Pull requests are reviewed here but never
-merged through the GitHub UI: an accepted patch is applied to the development
-repository and lands in the next export with your authorship on the commit. A
-precise issue is as valuable as a patch and often faster;
-[CONTRIBUTING.md](CONTRIBUTING.md) has the patch flow, and
-[TESTING.md](TESTING.md) says what a useful report contains.
+history has one commit per export. Pull requests are reviewed here but never
+merged through the GitHub UI. An accepted patch is applied to the development
+repository and lands in the next export with its authorship intact. A precise
+issue is often as useful as a patch. [CONTRIBUTING.md](CONTRIBUTING.md) explains
+the patch flow, and [TESTING.md](TESTING.md) says what a useful report contains.
 
 ## License
 
-Remixlet is free software under the GNU AGPL-3.0-only (see
-[LICENSE](LICENSE)). If you distribute a modified version, or run one that
+Remixlet is free software under the GNU AGPL-3.0-only. See
+[LICENSE](LICENSE). If you distribute a modified version, or run one that
 users interact with over a network, you must make its source available under
 the same terms.
 
-Your remixlets are yours. The AGPL covers the extension's code. The scripts you
-create with it, written against the published `rmx.*` API, are your own work,
-not derivatives of the extension, and you can license them however you like.
+Your remixlets are yours. The AGPL covers the extension's code. Scripts you
+create with it against the `rmx.*` API are your own work, not derivatives of
+the extension, and you can license them however you like.
 
-Contributions are accepted under the same license with no CLA; no one, the
-maintainer included, can ever relicense or close contributed code.
+Contributions use the same license with no CLA. No one, including the
+maintainer, can relicense or close contributed code.

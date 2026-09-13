@@ -9,10 +9,9 @@
 // points at, and the absence of every development-only hook.
 //
 // Usage: node tools/package.mjs [--out=<zip path>]
-// Without --out the zip is dist/remixlet-chrome-<version>-unverified.zip: a
-// local build is a real production build, but nothing here proves it matches a
-// published source tree, and the name says so. The release pipeline calls this
-// with --out and records the hash against the source it verified.
+// Without --out the zip is the local release candidate. `task publish` accepts
+// that candidate only when a clean build of the exported public tree produces
+// exactly the same bytes.
 // Zero npm deps; node >= 22.2 (zlib.crc32).
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
@@ -232,7 +231,7 @@ assert(
 // 3. Zip and write.
 console.log("== zip");
 const { version } = JSON.parse(fs.readFileSync(path.join(extensionRoot, "package.json"), "utf8"));
-const zipPath = outPath ?? path.join(extensionRoot, "dist", `remixlet-chrome-${version}-unverified.zip`);
+const zipPath = outPath ?? path.join(extensionRoot, "dist", `remixlet-chrome-${version}.zip`);
 const zip = buildZip(staged);
 fs.mkdirSync(path.dirname(zipPath), { recursive: true });
 fs.writeFileSync(zipPath, zip);

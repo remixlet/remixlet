@@ -7,7 +7,7 @@ tasks:
       - pnpm install
 
   build:
-    desc: Build the Chrome extension into apps/extension/dist/chrome/
+    desc: Build the deterministic Chrome release candidate into apps/extension/dist/chrome/ and apps/extension/dist/remixlet-chrome-<version>.zip
     dir: apps/extension
     cmds:
       - pnpm build

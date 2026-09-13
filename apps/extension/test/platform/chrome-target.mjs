@@ -8,7 +8,7 @@ import { assertPageAssetFetchBoundary } from "./page-asset-fetch-harness.mjs";
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..");
 const buildEnv = { ...process.env };
-const build = spawnSync(process.execPath, ["build.mjs", "--target=chrome"], {
+const build = spawnSync(process.execPath, ["build.mjs", "--target=chrome", "--release"], {
   cwd: repoRoot,
   stdio: "inherit",
   env: buildEnv,

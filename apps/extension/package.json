@@ -6,7 +6,7 @@
   "description": "Remix any website with a sentence — an AI agent inside a browser extension.",
   "type": "module",
   "scripts": {
-    "build": "node build.mjs --target=chrome",
+    "build": "node tools/package.mjs",
     "build:firefox": "node build.mjs --target=firefox",
     "build:safari": "node build.mjs --target=safari",
     "package": "node tools/package.mjs",
@@ -44,7 +44,8 @@
     "shadcn": "^4.13.1",
     "shiki": "4.3.1",
     "tailwind-merge": "^3.6.0",
-    "typebox": "1.1.38"
+    "typebox": "1.1.38",
+    "zod": "4.4.3"
   },
   "devDependencies": {
     "@oxlint/plugins": "1.79.0",
