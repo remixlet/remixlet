@@ -7,7 +7,8 @@
 import type { BrowserTarget } from "./ext.js";
 
 export type PlatformFeature =
-  | "userScripts"
+  | "box"
+  | "pageProbes"
   | "sidePanel"
   | "panelSurface"
   | "dnr"
@@ -18,8 +19,9 @@ export type PlatformFeature =
 
 export const PLATFORM_REASON_COPY = {
   chrome: {
-    userScripts:
-      'JavaScript remixlets are disabled until "Allow user scripts" is enabled for this extension in Chrome.',
+    box: "JavaScript remixlets are unavailable because this browser cannot host the box: it lacks the offscreen document or the scripting API that registers the page agent.",
+    pageProbes:
+      "Page reads are unavailable because this browser cannot run the extension's page scripts (scripting.executeScript is missing).",
     sidePanel: "Chrome's side-panel API is unavailable in this browser version.",
     panelSurface: "The Remixlet panel cannot open because this browser exposes no supported panel surface.",
     dnr: "Network-rule remixlets are unavailable because declarativeNetRequest is missing.",
@@ -31,8 +33,9 @@ export const PLATFORM_REASON_COPY = {
     oauthRedirect: "ChatGPT sign-in is unavailable because neither the DNR redirect nor webNavigation fallback exists.",
   },
   firefox: {
-    userScripts:
-      "JavaScript remixlets are disabled until Firefox's optional user-scripts permission is granted.",
+    box: "JavaScript remixlets are unavailable in Firefox: this build hosts the box in an offscreen document, which Firefox does not have. CSS and network-rule remixlets remain available.",
+    pageProbes:
+      "Page reads are unavailable because this Firefox runtime cannot run the extension's page scripts (scripting.executeScript is missing).",
     sidePanel: "Chrome's side-panel API is not available in Firefox; Remixlet uses the Firefox sidebar.",
     panelSurface: "The Remixlet panel cannot open because Firefox's sidebar API is unavailable.",
     dnr: "Network-rule remixlets are unavailable because declarativeNetRequest is missing.",
@@ -44,8 +47,9 @@ export const PLATFORM_REASON_COPY = {
     oauthRedirect: "ChatGPT sign-in is unavailable because the webNavigation callback fallback is missing.",
   },
   safari: {
-    userScripts:
-      "JavaScript remixlets are unavailable in Safari because it has no userScripts dynamic-code lane. CSS and supported network-rule remixlets remain available.",
+    box: "JavaScript remixlets are unavailable in Safari because it has no offscreen document and no sandboxed extension page to host the box. CSS and supported network-rule remixlets remain available.",
+    pageProbes:
+      "Page reads are unavailable because this Safari runtime cannot run the extension's page scripts (scripting.executeScript is missing).",
     sidePanel: "A browser sidebar is unavailable in Safari; Remixlet uses a focused popup panel.",
     panelSurface: "The Remixlet panel cannot open because Safari's popup-window API is unavailable.",
     dnr: "Network-rule remixlets are unavailable because this Safari version does not expose declarativeNetRequest.",
@@ -56,18 +60,6 @@ export const PLATFORM_REASON_COPY = {
     oauthRedirect: "ChatGPT sign-in is unavailable because the webNavigation callback fallback is missing.",
   },
 } satisfies Record<BrowserTarget, Record<PlatformFeature, string>>;
-
-/**
- * Chrome's userScripts row has a second string because Chrome asks for two
- * different unlocks depending on version: 138 introduced the per-extension
- * "Allow user scripts" toggle the table above names, and before that the API
- * was gated on Developer mode, which no per-extension toggle can turn on.
- * Which one is true for the running browser is decided in
- * user-scripts-gate.ts; naming the wrong switch sends people hunting for a
- * control their Chrome does not draw.
- */
-export const CHROME_DEV_MODE_USER_SCRIPTS_REASON =
-  'JavaScript remixlets are disabled until Developer mode is turned on in chrome://extensions — this Chrome is older than 138, so it has no per-extension "Allow user scripts" toggle.';
 
 export function platformReason(target: BrowserTarget, feature: PlatformFeature): string {
   return PLATFORM_REASON_COPY[target][feature];

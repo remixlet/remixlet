@@ -1,32 +1,11 @@
-// Page probing for the agent's verification loops (wiki/handoff.md §7: evaluate_js,
-// navigate). Evaluation uses chrome.userScripts.execute — one-shot injection
-// of a code string into the USER_SCRIPT world: the same sanctioned sandbox
-// remixlet code runs in, no eval in extension contexts.
+// The agent's `navigate` tool, worker side (wiki/handoff.md §7): drive the
+// bound tab to a URL within its site and wait for the new page's remixlets
+// to settle. The site check itself is the caller's (worker/index.ts,
+// assertNavigationWithinSite). Nothing here is state.
 
 import { ext } from "../platform/ext.js";
-import { scriptInjector } from "../platform/script-injector.js";
 import { invalidateCaptureDigestForTab, invalidateCaptureDigestForUrl } from "./capture-freshness.js";
-
-export async function evaluateInPage(tabId: number, code: string): Promise<string> {
-  const backend = scriptInjector();
-  if (!backend.available) throw new Error(backend.disabledReason);
-  // The expression's completion value is serialized in-page so structured
-  // results cross the boundary as JSON text.
-  const wrapped = `(async () => {
-    try {
-      const __value = await (async () => (${code}))();
-      return JSON.stringify({ ok: true, value: __value === undefined ? "undefined" : JSON.stringify(__value) });
-    } catch (error) {
-      return JSON.stringify({ ok: false, message: String(error) });
-    }
-  })()`;
-  const [injection] = await backend.execute(tabId, wrapped);
-  if (injection?.error) throw new Error(injection.error);
-  // SAFETY: evaluateInPage serializes this exact discriminated reply with JSON.stringify before injection returns it.
-  const outcome = JSON.parse(String(injection?.result)) as { ok: boolean; value?: string; message?: string };
-  if (!outcome.ok) throw new Error(outcome.message ?? "evaluation failed");
-  return outcome.value ?? "undefined";
-}
+import { settleTab } from "./box.js";
 
 export async function navigateTab(tabId: number, url: string): Promise<void> {
   const parsed = new URL(url);
@@ -42,7 +21,11 @@ export async function navigateTab(tabId: number, url: string): Promise<void> {
   const deadline = Date.now() + 20000;
   while (Date.now() < deadline) {
     const tab = await ext.tabs.get(tabId);
-    if (tab.status === "complete" && tab.url && new URL(tab.url).href.startsWith(parsed.origin)) return;
+    if (tab.status === "complete" && tab.url && new URL(tab.url).href.startsWith(parsed.origin)) {
+      // The remixlets on the new page have run by now; wait for their first pass to finish.
+      await settleTab(tabId);
+      return;
+    }
     await new Promise((r) => setTimeout(r, 150));
   }
   throw new Error(`navigate: ${url} did not finish loading within 20s`);

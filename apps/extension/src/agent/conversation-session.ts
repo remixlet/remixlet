@@ -66,7 +66,14 @@ export function sanitizeDanglingToolCalls(messages: AgentMessage[]): AgentMessag
  */
 export type SessionTranscriptItem =
   | { kind: "user" | "assistant"; text: string }
-  | { kind: "tool"; toolName: string; ok: boolean; failure?: ToolFailureKind };
+  | {
+      kind: "tool";
+      toolName: string;
+      ok: boolean;
+      failure?: ToolFailureKind;
+      /** A bounced step's stored result text — what its plain-words chat phrase is chosen from. */
+      reason?: string;
+    };
 
 export class ConversationSession {
   readonly id: string;
@@ -205,11 +212,14 @@ export class ConversationSession {
         // Failed steps are classified from the stored result text so a resume
         // renders bounces/gate-rejections/declines the way the live chat did,
         // not as a wall of red "Couldn't …" rows.
+        const resultText = message.isError ? extractText(message.content) : undefined;
+        const failure = resultText === undefined ? undefined : classifyToolFailure(resultText);
         items.push({
           kind: "tool",
           toolName: message.toolName,
           ok: !message.isError,
-          failure: message.isError ? classifyToolFailure(extractText(message.content)) : undefined,
+          failure,
+          reason: failure === "bounced" ? resultText : undefined,
         });
       }
     }

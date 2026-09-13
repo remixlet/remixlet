@@ -10,23 +10,12 @@ export async function assertActiveTabResolution() {
   let lastFocusedWindow = {};
   let currentError;
   let fallbackCalls = 0;
-  let pinnedTab;
-  let pinnedCalls = 0;
-  let sessionStore = {};
 
   globalThis.chrome = {
     runtime: {
       getURL: (value) => `chrome-extension://active-tab-contract/${value}`,
     },
-    storage: {
-      // The drawer nonce lives in session state keyed remixletDrawer:<tabId>.
-      session: { get: async (key) => (key in sessionStore ? { [key]: sessionStore[key] } : {}) },
-    },
     tabs: {
-      get: async (tabId) => {
-        pinnedCalls += 1;
-        return pinnedTab?.id === tabId ? pinnedTab : undefined;
-      },
       query: async () => {
         if (currentError) throw currentError;
         return currentTabs;
@@ -57,19 +46,13 @@ export async function assertActiveTabResolution() {
   const source = result.outputFiles[0].text;
   const contract = await import(`data:text/javascript;base64,${Buffer.from(source).toString("base64")}`);
 
-  // An extension popup/side panel normally has no tabId query parameter.
-  // The regression converted the missing value with Number(null) => 0, so a
-  // real Chrome tab 0 stole the surface from the active SoundCloud page.
-  globalThis.location = { protocol: "chrome-extension:", search: "" };
-  pinnedTab = { id: 0, url: "https://example.com/", windowId: 1, active: false };
   currentTabs = [{ id: 11, url: "https://soundcloud.com/feed", windowId: 2, active: true }];
   assert.deepEqual(await contract.resolveActiveBrowserTab(), {
     id: 11,
     url: "https://soundcloud.com/feed",
     windowId: 2,
   });
-  assert.equal(pinnedCalls, 0, "a missing tabId never probes Chrome's valid tab 0");
-  assert.equal(fallbackCalls, 0, "normal Chrome popup keeps the current-window path");
+  assert.equal(fallbackCalls, 0, "normal popup keeps the current-window path");
 
   currentTabs = [];
   lastFocusedWindow = {
@@ -85,7 +68,7 @@ export async function assertActiveTabResolution() {
     url: "https://airbnb.com/rooms/1",
     windowId: 2,
   });
-  assert.equal(fallbackCalls, 1, "detached Arc popup falls back to the last-focused normal window");
+  assert.equal(fallbackCalls, 1, "a detached popup falls back to the last-focused normal window");
 
   currentTabs = [{ id: 12, url: "chrome://extensions/", windowId: 2, active: true }];
   assert.deepEqual(await contract.resolveActiveBrowserTab(), {
@@ -111,34 +94,6 @@ export async function assertActiveTabResolution() {
     url: "https://airbnb.com/rooms/1",
     windowId: 2,
   });
-
-  // The drawer pins its tab with ?tabId= AND a ?nonce= matching the worker's
-  // stored drawer session state — only then is the pinned tab honored (H3).
-  globalThis.location = { protocol: "chrome-extension:", search: "?surface=drawer&tabId=21&nonce=n21" };
-  pinnedTab = { id: 21, url: "https://airbnb.com/rooms/21", windowId: 4, active: true };
-  sessionStore = { "remixletDrawer:21": { windowId: 4, conversationId: "c", nonce: "n21" } };
-  assert.deepEqual(await contract.resolveActiveBrowserTab(), {
-    id: 21,
-    url: "https://airbnb.com/rooms/21",
-    windowId: 4,
-  });
-  assert.equal(pinnedCalls, 1, "a drawer tabId with a matching nonce uses the pinned-tab path");
-
-  // A hostile frame passing a bare ?tabId= (no nonce, no stored drawer state)
-  // is refused: resolution falls through to the active tab, never the tab the
-  // page named (Chain C). The pinned-tab path is not even probed.
-  globalThis.location = { protocol: "chrome-extension:", search: "?surface=drawer&tabId=99" };
-  pinnedTab = { id: 99, url: "https://webmail.example/inbox", windowId: 8, active: true };
-  sessionStore = {};
-  currentTabs = [{ id: 30, url: "https://the-real-active-page.example/", windowId: 5, active: true }];
-  assert.deepEqual(await contract.resolveActiveBrowserTab(), {
-    id: 30,
-    url: "https://the-real-active-page.example/",
-    windowId: 5,
-  });
-  assert.equal(pinnedCalls, 1, "a nonceless ?tabId= never probes the pinned tab");
-  currentTabs = [];
-  delete globalThis.location;
 
   currentTabs = [];
   lastFocusedWindow = { id: 2, type: "normal", tabs: [] };

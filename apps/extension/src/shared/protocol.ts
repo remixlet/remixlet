@@ -7,28 +7,32 @@ import type { CaptureRequest, CaptureResult } from "../platform/observation/type
 import type { CaptureRef } from "../store/capture-store.js";
 import type { ConversationMeta } from "../store/conversation-index.js";
 import type { RegistryEntry, RemixletVersion } from "../store/remixlet-store.js";
-import type { ActivationOutcome, CapabilityApprovalProposal } from "../worker/activation.js";
+import type { ActivationOutcome, CapabilityApprovalProposal, SiteAuthorization } from "../worker/activation.js";
 import type { MenuCommandSummary } from "../worker/menu.js";
 import type { PageMark } from "./annotation.js";
 import type { ScriptLogEntry } from "./script-log.js";
 import type { ShowChangesSummary, VerifiedAssertion } from "./show-changes.js";
+import type { LookReview } from "./look-review.js";
+import type { LookCaptureResult } from "../worker/look-review.js";
 import type { UsageRecord } from "./usage.js";
 import type { ProbeName } from "./probe-schemas.js";
+import type { BoundPage } from "./page-binding.js";
 
+// `page` rides every message that READS or DRIVES the bound tab: it is the
+// page the conversation was pointed at, written by the panel from its tab
+// binding and never by the model (shared/page-binding.ts). The worker compares
+// the tab against it before the read and again before the result is handed on,
+// and refuses when the tab moved to another site — the stop that replaced the
+// advisory drift note (wiki/design/page-binding.md). Omitted by callers with no
+// binding: the manager's own actions, the harness suites, restart reconciles.
 export type PanelToWorker =
-  | { kind: "drawer.closed" }
-  // Sent once by every panel document as it boots. The worker can see from the
-  // sender whether this panel landed in a browser-owned sidebar or inside a
-  // tab, and that is the only proof this browser's side panel is real rather
-  // than a silent no-op (platform/panel-surface.ts).
-  | { kind: "panel.hello" }
   | { kind: "capabilities.get" }
   // conversationEpoch identifies the panel's live conversation runtime (a
   // fresh id per tool belt). It scopes the worker's unchanged-page
   // short-circuit: a "you already have this capture" reply is only true for
   // the runtime that received the referenced capture — omitted or different,
   // the worker always returns full content.
-  | { kind: "capture.request"; request: CaptureRequest; conversationEpoch?: string }
+  | { kind: "capture.request"; request: CaptureRequest; conversationEpoch?: string; page?: BoundPage }
   // Remixlet lifecycle: the worker owns all store writes (single writer);
   // these back the agent's write_remixlet / list_remixlets / rollback tools
   // and, later, the history & manager UI.
@@ -38,7 +42,19 @@ export type PanelToWorker =
   // conversationId = the chat performing the write; the worker records the
   // conversation→remixlet link in the sidecar index atomically with the
   // activation, so the link survives a panel death right after the write.
-  | { kind: "remixlet.activate"; files: Record<string, string>; message?: string; reloadTabId?: number; conversationId?: string }
+  // authorization = the page the conversation is bound to, captured by the
+  // panel from its tab binding (never by the model). The worker measures the
+  // manifest's matches against it and refuses when the tab has closed or
+  // left the site. Omitted only by a caller with no page binding, whose
+  // scope then always goes through the approval dialog.
+  | {
+      kind: "remixlet.activate";
+      files: Record<string, string>;
+      message?: string;
+      reloadTabId?: number;
+      conversationId?: string;
+      authorization?: SiteAuthorization;
+    }
   | {
       kind: "remixlet.resolveCapabilityApproval";
       proposalId: string;
@@ -47,16 +63,21 @@ export type PanelToWorker =
       message?: string;
       reloadTabId?: number;
       conversationId?: string;
+      authorization?: SiteAuthorization;
     }
   | { kind: "remixlet.list" }
-  | { kind: "remixlet.read"; id: string }
+  // `authorization` marks an agent-originated read: the panel sends the
+  // chat's bound site (panel-authored, never model-supplied) and the worker
+  // refuses a remixlet that does not belong to that site. A read with no
+  // authorization is a user action (the manager, the harness) and returns
+  // any visible remixlet.
+  | { kind: "remixlet.read"; id: string; authorization?: SiteAuthorization }
   | { kind: "remixlet.setEnabled"; id: string; enabled: boolean; reloadTabId?: number; reloadMatching?: boolean }
-  // Trust surface: the capabilities a remixlet declares vs. currently holds, and
-  // per-capability revocation (the only way to walk back one grant short of
-  // deleting the whole remixlet). Revoke reloads the remixlet's matching tabs so
-  // already-injected code loses the capability immediately.
+  // Trust surface: the capabilities a remixlet holds. The stored manifest is
+  // the approval record (activation gates every write on approval), so there
+  // is no declared-vs-granted split — walking back a capability means asking a
+  // chat for a version without it, or archiving/deleting the remixlet.
   | { kind: "remixlet.capabilities"; id: string }
-  | { kind: "remixlet.revokeCapability"; id: string; capability: string }
   | { kind: "remixlet.versions"; id: string }
   | { kind: "remixlet.rollback"; id: string; sha: string; reloadTabId?: number; reloadMatching?: boolean }
   | {
@@ -129,19 +150,12 @@ export type PanelToWorker =
   | { kind: "site.pausedList" }
   | { kind: "menu.list"; tabId: number }
   | { kind: "menu.invoke"; tabId: number; registrationId: string }
-  // Onboarding's "finish setup": if the worker's own context already sees
-  // userScripts it just reconciles; otherwise it flags storage and reloads
-  // the extension (the one sanctioned runtime.reload — a fresh worker context
-  // is the only way the API materializes there).
-  | { kind: "onboarding.finish" }
   // Page probing for the agent's verification loops. probe runs a fixed
   // extension-authored template (src/worker/page-probes/) with the model's
-  // params crossing only as JSON data — the default lane. evaluate runs a
-  // freeform code string the same way, but is the approval-gated escape
-  // hatch: the panel shows the code to the user and sends this only after an
-  // explicit click. Both use userScripts.execute in the USER_SCRIPT world —
-  // the sanctioned dynamic-code lane, same sandbox remixlets live in. The
-  // worker revalidates probe params against probe-schemas at this boundary.
+  // params crossing only as JSON data; no lane runs a model-written code
+  // string in the tab (the probes are shipped files injected through
+  // scripting.executeScript). The worker revalidates probe params against
+  // probe-schemas at this boundary.
   // buildId is the sender's compiled-in build stamp (shared/build-id.ts); the
   // worker refuses the probe with a named "build mismatch" error when it
   // differs from its own, so a stale worker cannot masquerade as a schema
@@ -150,9 +164,31 @@ export type PanelToWorker =
   // `params`, not inside it) scopes the observe_network_bodies grant gate to
   // the conversation that was granted observation, so a lingering grant from
   // another conversation on the same origin cannot authorize this read.
-  | { kind: "page.probe"; tabId: number; probe: ProbeName; params: unknown; buildId: string; conversationId?: string }
-  | { kind: "page.evaluate"; tabId: number; code: string }
-  | { kind: "page.navigate"; tabId: number; url: string }
+  | {
+      kind: "page.probe";
+      tabId: number;
+      probe: ProbeName;
+      params: unknown;
+      buildId: string;
+      conversationId?: string;
+      page?: BoundPage;
+    }
+  // The look review's capture (wiki/design/look-review.md): locate the added
+  // element and the host exemplar in the tab, take ONE visible-tab screenshot
+  // (two when the exemplar is off-screen), crop each at native device pixels,
+  // and return the crops for the model to judge. params are revalidated
+  // against the locate_for_review probe schema at this boundary like every
+  // page.probe; buildId carries the same skew check. remixletId (panel-
+  // sourced, the activation under review) lets the worker store the subject
+  // crop beside the remixlet so the manager can show what Claude looked at.
+  | { kind: "look.capture"; tabId: number; params: unknown; buildId: string; remixletId?: string; page?: BoundPage }
+  // The recorded look verdict (record_look), stored beside the verification
+  // marker on the current version. Sanitized worker-side; a malformed review
+  // is dropped, never stored.
+  | { kind: "remixlet.recordLookReview"; id: string; review: LookReview }
+  // The stored subject crop for the manager's "what Claude looked at" view.
+  | { kind: "remixlet.readLookCrop"; id: string }
+  | { kind: "page.navigate"; tabId: number; url: string; page?: BoundPage }
   // Development-time observation grant (wiki/raw/handoffs/
   // 2026-08-10-broad-observe-session-grant.md). enable is sent ONLY from the
   // panel's dev-observe card click handler: the worker pins the grant to the
@@ -164,10 +200,9 @@ export type PanelToWorker =
   | { kind: "devObserve.enable"; conversationId: string; tabId: number }
   | { kind: "devObserve.disable"; conversationId: string }
   // Annotate-page mode (shared/annotation.ts). start: the panel's pencil
-  // button — the worker hides the drawer, injects annotate-host.js, and opens
-  // markup mode on the tab. result: sent BY the overlay content script (like
-  // drawer.closed, a tab-sender message) when the user finishes; the worker
-  // restores the drawer, and the panel — which receives the same broadcast —
+  // button — the worker injects annotate-host.js and opens markup mode on the
+  // tab. result: sent BY the overlay content script (a tab-sender message)
+  // when the user finishes; the panel — which receives the same broadcast —
   // takes the payload as the next prompt's attachment. reopen: sent by the
   // overlay's idle pill after Done — the worker re-runs the start pipeline
   // for the sender's tab.
@@ -192,13 +227,11 @@ export type PanelToWorker =
   // Site favicon snapshots: the panel reports the bound tab's favicon when a
   // chat binds (worker/site-icons.ts fetches + stores it once per source URL);
   // the control center reads them back to decorate site names.
-  | { kind: "siteIcon.record"; siteKey: string; favIconUrl?: string }
+  | { kind: "siteIcon.record"; siteKey: string; pageOrigin: string; favIconUrl?: string }
   | { kind: "siteIcon.refresh"; siteKey: string }
   | { kind: "siteIcon.list" };
 
 export type WorkerToPanel =
-  | { kind: "drawer.closedAck" }
-  | { kind: "panel.helloAck" }
   | { kind: "capabilities.result"; capabilities: PlatformCapabilities }
   // On success, `ref` points at the persisted copy in OPFS captures/ (absent
   // only if persistence failed — then bundle.missing says so).
@@ -215,12 +248,18 @@ export type WorkerToPanel =
     }
   | { kind: "remixlet.activated"; outcome: ActivationOutcome }
   | { kind: "remixlet.capabilityDenied" }
-  | { kind: "remixlet.listed"; entries: RegistryEntry[] }
+  /**
+   * `quarantined`: enabled artifacts the worker refuses to run, id → reason
+   * (worker/eligibility.ts). Distinct from the registry state, which stays
+   * "enabled": the user did not switch these off, the worker could not admit
+   * them (unreadable files, invalid rules, bridge skew).
+   */
+  | { kind: "remixlet.listed"; entries: RegistryEntry[]; quarantined: Record<string, string> }
   // headSha/version let the panel's read_remixlet tool answer a re-read of
   // unchanged content with a short notice instead of resending every file.
   | { kind: "remixlet.content"; files: Record<string, string>; headSha: string; version: number }
   | { kind: "remixlet.versionsListed"; versions: RemixletVersion[] }
-  | { kind: "remixlet.capabilitiesResult"; id: string; declared: string[]; granted: string[] }
+  | { kind: "remixlet.capabilitiesResult"; id: string; capabilities: string[] }
   | { kind: "remixlet.entry"; entry: RegistryEntry }
   // Reply to remixlet.destroy — no entry to return; it no longer exists.
   | { kind: "remixlet.destroyed"; id: string }
@@ -239,7 +278,6 @@ export type WorkerToPanel =
   | { kind: "site.pausedState"; pausedSiteKeys: string[] }
   | { kind: "menu.listed"; commands: MenuCommandSummary[] }
   | { kind: "menu.invoked"; queued: boolean }
-  | { kind: "onboarding.finished"; reloading: boolean }
   | { kind: "annotation.started"; ok: boolean; message?: string }
   | { kind: "annotation.resultAck" }
   // summary reports what the overlay actually drew — highlighted marks plus
@@ -249,13 +287,16 @@ export type WorkerToPanel =
   | { kind: "showChanges.started"; ok: false; message: string }
   | { kind: "page.probed"; ok: true; value: string }
   | { kind: "page.probed"; ok: false; message: string }
+  | { kind: "look.captured"; ok: true; result: LookCaptureResult }
+  | { kind: "look.captured"; ok: false; message: string; reason?: "screenshot-identity-changed" }
+  | { kind: "remixlet.lookReviewRecorded"; entry: RegistryEntry }
+  // dataUrl absent = no crop stored for this remixlet.
+  | { kind: "remixlet.lookCrop"; id: string; dataUrl?: string }
   // origin = the exact origin the grant was pinned to (shown nowhere raw, but
   // threaded into the panel-authored continuation prompt).
   | { kind: "devObserve.enabled"; ok: true; origin: string }
   | { kind: "devObserve.enabled"; ok: false; message: string }
   | { kind: "devObserve.disabled" }
-  | { kind: "page.evaluated"; ok: true; value: string }
-  | { kind: "page.evaluated"; ok: false; message: string }
   | { kind: "page.navigated"; ok: boolean; message?: string }
   | { kind: "codex.begun"; ok: boolean; message?: string }
   | { kind: "codex.statusResult"; status: CodexAuthStatus }

@@ -19,6 +19,14 @@ export interface ChatPreferences {
   version: 1;
   theme: ThemePreference;
   verbosity: ChatVerbosity;
+  /**
+   * Whether the panel raises a system notification when the agent is waiting
+   * on a permission answer (an access dialog, a script approval, or a
+   * one-click grant card) and the chat is not in view. On by default: an
+   * unanswered ask is a stalled build, and the user has usually switched
+   * away by then. Off for anyone the toasts annoy (panel/ask-notifications.ts).
+   */
+  askNotifications: boolean;
 }
 
 export const CHAT_PREFERENCES_KEY = "chatPreferences";
@@ -27,6 +35,7 @@ export const DEFAULT_CHAT_PREFERENCES: ChatPreferences = {
   version: 1,
   theme: "system",
   verbosity: "standard",
+  askNotifications: true,
 };
 
 const THEMES: readonly ThemePreference[] = ["system", "light", "dark"];
@@ -37,10 +46,14 @@ export function normalizeChatPreferences<T>(stored: T): ChatPreferences {
   const raw = Object(stored);
   const theme = raw.theme;
   const verbosity = raw.verbosity;
+  const askNotifications = raw.askNotifications;
   return {
     version: 1,
     theme: isTheme(theme) ? theme : "system",
     verbosity: isChatVerbosity(verbosity) ? verbosity : "standard",
+    // Absent in every value written before the field existed: those installs
+    // get the default, not a silent off.
+    askNotifications: askNotifications === false ? false : true,
   };
 }
 

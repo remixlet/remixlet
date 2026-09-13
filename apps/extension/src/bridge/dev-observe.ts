@@ -1,169 +1,108 @@
-// MAIN-world codegen for the development-time network observer
+// The development-time network observer
 // (wiki/raw/handoffs/2026-08-10-broad-observe-session-grant.md): an
-// extension-owned sibling of relay.ts's network:observe interceptor, injected
-// as its OWN registration (worker/dev-observe.ts builds it) while a
-// conversation holds the dev-observe grant. It buffers the page's own
-// fetch/XHR response bodies so the agent's observe_network_bodies probe can
-// read where the data really lives BEFORE any capability is requested.
+// extension-owned sibling of relay.ts, shipped as its own file
+// (dev-observe.js, entry dev-observe-entry.ts) and registered as ONE
+// MAIN-world content script over the origins pinned by the live dev-observe
+// grants (worker/injection.ts) while a conversation holds a grant. It buffers
+// the page's own fetch/XHR response bodies so the agent's
+// observe_network_bodies probe can read where the data really lives BEFORE
+// any capability is requested.
 //
-// Differences from the remixlet interceptor, all deliberate:
-// - No host patterns: it observes every host the page contacts. Scope comes
-//   from the registration's matches (the origin pinned at grant time) and the
-//   conversation-scoped grant record, not from per-host grants.
-// - Textual responses only (JSON/text content types): broad observation of
-//   media/asset bodies would buffer megabytes for nothing.
-// - Entries carry the request METHOD — the whole point is verifying endpoints
-//   replay cannot reach, and "it was a POST" is part of that answer.
-// - Delivery is a sync request/reply CustomEvent pair read by the probe lane,
-//   not the remixlet relay: no remixlet exists yet while this runs.
+// Differences from the relay, all deliberate:
+// - No agent, no relay events: no remixlet exists yet while this runs, and
+//   the page agent is not registered on an origin only a grant names.
+// - Only the latest body per URL+method is held (createResponseRing
+//   latestPerUrl), so a poll cannot evict a load-time data response.
+// - Delivery is a sync request/reply CustomEvent pair, read by the probe:
+//   the probe dispatches DEV_OBSERVE_REQUEST_EVENT with a JSON-string detail
+//   { urlFilter?, limit? } and hears DEV_OBSERVE_REPLY_EVENT synchronously
+//   during its own dispatch, detail JSON { total, matched, recorded, entries }
+//   (shared/dev-observe.ts documents the contract; the probe's world changed
+//   when it became a shipped file, this pair did not).
 //
-// Trust posture, same as the relay (relay.ts header): the MAIN world is
-// page-shared, so the page can observe or forge this traffic — every body here
-// is the page's OWN response data, and the token names events, it grants
-// nothing. The model-facing gate is the worker's grant check on the probe.
+// The event names are constants, not per-grant tokens: a shipped file can
+// receive no per-registration data, and the token never was authority. The
+// model-facing gate is the worker's grant check on the probe
+// (worker/index.ts devObserveProbeParams): without a live grant for the
+// conversation and the tab's origin the probe never runs. What the buffer
+// holds is the page's OWN response data, in the page's own world.
+//
+// Trust posture, same as the relay: the MAIN world is page-shared, so the
+// page can observe or forge this traffic; nothing here evaluates a string.
 
-import { OBSERVE_BODY_CAP, OBSERVE_BUFFER_BYTE_BUDGET, OBSERVE_BUFFER_MAX } from "./relay.js";
-import { devObserveReplyEventName, devObserveRequestEventName } from "../shared/dev-observe.js";
+import { DEV_OBSERVE_REPLY_EVENT, DEV_OBSERVE_REQUEST_EVENT } from "../shared/dev-observe.js";
+import {
+  OBSERVE_BUFFER_BYTE_BUDGET,
+  OBSERVE_BUFFER_MAX,
+  captureNatives,
+  createResponseRing,
+  installNetworkCapture,
+} from "./relay.js";
 
-export interface DevObserveCodeOptions {
-  /** Names the sync events; embedded in page-readable MAIN-world code. */
-  token: string;
+function isString<Value>(value: Value): value is Value & string {
+  return Object.prototype.toString.call(value) === "[object String]";
+}
+
+function isNumber<Value>(value: Value): value is Value & number {
+  return Object.prototype.toString.call(value) === "[object Number]";
+}
+
+interface ReadRequest {
+  urlFilter: string | undefined;
+  limit: number;
+}
+
+/** The probe's request detail, decoded; a malformed one reads everything. */
+function parseReadRequest(detail: string): ReadRequest {
+  const request: ReadRequest = { urlFilter: undefined, limit: OBSERVE_BUFFER_MAX };
+  let parsed: { urlFilter?: string; limit?: number };
+  try {
+    // SAFETY: the probe serializes { urlFilter?, limit? }; unexpected shapes fall back to the defaults below.
+    parsed = JSON.parse(detail) as { urlFilter?: string; limit?: number };
+  } catch {
+    return request;
+  }
+  if (Object.prototype.toString.call(parsed) !== "[object Object]") return request;
+  if (isString(parsed.urlFilter) && parsed.urlFilter.length > 0) request.urlFilter = parsed.urlFilter;
+  if (isNumber(parsed.limit) && parsed.limit >= 1) request.limit = Math.floor(parsed.limit);
+  return request;
+}
+
+export interface DevObserverInstallation {
+  /** Stop answering reads (the fetch/XHR wrappers stay, inert); tests install more than one observer per page. */
+  stop(): void;
 }
 
 /**
- * One self-contained IIFE: fetch/XHR patches feeding a capped ring buffer,
- * plus the sync read listener. Idempotent per token — a re-registration that
- * races an already-injected document must not double-patch fetch.
+ * Install the observer on a document: wrap fetch and XHR into a latest-per-URL
+ * ring and answer the probe's sync reads. Natives are captured at install
+ * time (document_start), as the relay does.
  */
-export function devObserveCode(options: DevObserveCodeOptions): string {
-  return `(() => {
-  try {
-    // Per-token double-install guard (same __rmx marker convention as rmx.ts).
-    const guards = (window.__rmxDevObsInstalled = window.__rmxDevObsInstalled || {});
-    if (guards[${JSON.stringify(options.token)}]) return;
-    guards[${JSON.stringify(options.token)}] = true;
-
-    // Textual filter: JSON (incl. +json suffixes) and text/* bodies only.
-    const isTextual = (contentType) =>
-      typeof contentType === "string" && (contentType.includes("json") || contentType.slice(0, 5) === "text/");
-    const isHttpUrl = (raw) => {
-      try {
-        const url = new URL(raw, location.href);
-        return url.protocol === "http:" || url.protocol === "https:";
-      } catch { return false; }
-    };
-
-    const buffer = [];
-    let bufferBytes = 0;
-    let seq = 0;
-    const record = (rawUrl, method, status, contentType, bodyText) => {
-      const text = String(bodyText == null ? "" : bodyText);
-      let url = rawUrl;
-      try { url = new URL(rawUrl, location.href).href; } catch {}
-      const entry = {
-        seq: (seq += 1),
-        url,
-        method: typeof method === "string" && method.length > 0 ? method.toUpperCase() : "GET",
-        status,
-        contentType: contentType || null,
-        body: text.length > ${OBSERVE_BODY_CAP} ? text.slice(0, ${OBSERVE_BODY_CAP}) : text,
-        truncated: text.length > ${OBSERVE_BODY_CAP},
-      };
-      // Keep only the LATEST body per URL+method: pages poll endpoints (an
-      // activities check every few seconds), and identical polls evicting
-      // distinct load-time responses is how the soundcloud /stream feed body
-      // vanished before the agent could read it. seq keeps counting every
-      // response ever recorded, so the probe can report the gap honestly.
-      for (let index = buffer.length - 1; index >= 0; index -= 1) {
-        if (buffer[index].url === entry.url && buffer[index].method === entry.method) {
-          bufferBytes -= buffer[index].body.length;
-          buffer.splice(index, 1);
-          break;
-        }
-      }
-      buffer.push(entry);
-      bufferBytes += entry.body.length;
-      while (buffer.length > ${OBSERVE_BUFFER_MAX} || bufferBytes > ${OBSERVE_BUFFER_BYTE_BUDGET}) {
-        bufferBytes -= buffer.shift().body.length;
-      }
-    };
-
-    // fetch — transparent pass-through: the page always receives the ORIGINAL
-    // promise/response; observation reads a clone, and only textual bodies.
-    const originalFetch = window.fetch;
-    if (typeof originalFetch === "function") {
-      window.fetch = function () {
-        const result = originalFetch.apply(this, arguments);
-        try {
-          const input = arguments[0];
-          const init = arguments[1];
-          const rawUrl =
-            typeof input === "string" ? input : input instanceof URL ? input.href : input && input.url;
-          const method = (init && init.method) || (input && typeof input === "object" && input.method) || "GET";
-          if (rawUrl && isHttpUrl(rawUrl) && result && typeof result.then === "function") {
-            result.then((response) => {
-              try {
-                if (!response || typeof response.clone !== "function") return;
-                const contentType = response.headers && response.headers.get("content-type");
-                if (!isTextual(contentType)) return;
-                const clone = response.clone();
-                clone.text().then((text) => record(rawUrl, method, response.status, contentType, text), () => {});
-              } catch {}
-            }, () => {});
-          }
-        } catch {}
-        return result;
-      };
+export function installDevObserver(window: Window & typeof globalThis): DevObserverInstallation {
+  const natives = captureNatives(window);
+  const ring = createResponseRing({ max: OBSERVE_BUFFER_MAX, byteBudget: OBSERVE_BUFFER_BYTE_BUDGET, latestPerUrl: true });
+  installNetworkCapture(window, natives, (captured) => {
+    ring.record(captured, window.location.href);
+  });
+  const onRead = (event: Event): void => {
+    try {
+      const request = parseReadRequest(event instanceof natives.CustomEvent ? String(event.detail) : "");
+      const held = ring.entries();
+      const matched = request.urlFilter === undefined ? held : held.filter((entry) => entry.url.includes(request.urlFilter!));
+      natives.dispatchEvent(
+        new natives.CustomEvent(DEV_OBSERVE_REPLY_EVENT, {
+          detail: JSON.stringify({
+            total: held.length,
+            matched: matched.length,
+            recorded: ring.recorded(),
+            entries: matched.slice(-request.limit),
+          }),
+        }),
+      );
+    } catch {
+      // The probe reports "observer-not-running" when no reply lands.
     }
-
-    // XHR — stash url+method at open, read textual bodies at load.
-    const Xhr = window.XMLHttpRequest;
-    if (Xhr && Xhr.prototype) {
-      const originalOpen = Xhr.prototype.open;
-      const originalSend = Xhr.prototype.send;
-      Xhr.prototype.open = function (method, url) {
-        try {
-          this.__rmxDevObsUrl = typeof url === "string" ? url : String(url);
-          this.__rmxDevObsMethod = typeof method === "string" ? method : String(method);
-        } catch {}
-        return originalOpen.apply(this, arguments);
-      };
-      Xhr.prototype.send = function () {
-        try {
-          const rawUrl = this.__rmxDevObsUrl;
-          if (rawUrl && isHttpUrl(rawUrl)) {
-            this.addEventListener("load", function () {
-              try {
-                if (this.responseType !== "" && this.responseType !== "text" && this.responseType !== "json") return;
-                const contentType = this.getResponseHeader("content-type");
-                if (!isTextual(contentType)) return;
-                const text = this.responseType === "json" ? JSON.stringify(this.response) : this.responseText;
-                record(rawUrl, this.__rmxDevObsMethod, this.status, contentType, text);
-              } catch {}
-            });
-          }
-        } catch {}
-        return originalSend.apply(this, arguments);
-      };
-    }
-
-    // Sync read: the probe dispatches the request event (JSON-string detail:
-    // { urlFilter, limit }) and hears the reply synchronously during dispatch.
-    document.addEventListener(${JSON.stringify(devObserveRequestEventName(options.token))}, (event) => {
-      try {
-        let urlFilter;
-        let limit = ${OBSERVE_BUFFER_MAX};
-        try {
-          const detail = event instanceof CustomEvent ? JSON.parse(String(event.detail)) : {};
-          if (typeof detail.urlFilter === "string" && detail.urlFilter.length > 0) urlFilter = detail.urlFilter;
-          if (typeof detail.limit === "number" && detail.limit >= 1) limit = Math.floor(detail.limit);
-        } catch {}
-        const matched = urlFilter === undefined ? buffer.slice() : buffer.filter((entry) => entry.url.includes(urlFilter));
-        document.dispatchEvent(new CustomEvent(${JSON.stringify(devObserveReplyEventName(options.token))}, {
-          detail: JSON.stringify({ total: buffer.length, matched: matched.length, recorded: seq, entries: matched.slice(-limit) }),
-        }));
-      } catch {}
-    });
-  } catch {}
-})();`;
+  };
+  natives.addEventListener(DEV_OBSERVE_REQUEST_EVENT, onRead);
+  return { stop: () => natives.removeEventListener(DEV_OBSERVE_REQUEST_EVENT, onRead) };
 }

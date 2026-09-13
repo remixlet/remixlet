@@ -10,6 +10,7 @@ import { Type, type Static } from "typebox";
 import { Check, Parse } from "typebox/value";
 import { createOwnedNotification } from "../platform/notifications.js";
 import { matchesPaused, urlMatchesAny } from "../shared/site-key.js";
+import { hasCapabilityGrant } from "./activation.js";
 import { readMirror } from "./injection.js";
 import { readPausedSites } from "./site-pause.js";
 
@@ -72,7 +73,6 @@ export interface ScheduleRegistration {
 }
 
 const STATE_KEY = "remixletSchedules";
-const CAPABILITY_GRANTS_KEY = "remixletCapabilityGrants";
 const SITE_OPEN_SESSION_KEY = "remixletScheduleSiteOpenSession";
 const ALARM_PREFIX = "rmx-schedule:";
 const NAME_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_.:-]{0,63}$/;
@@ -224,12 +224,24 @@ export async function clearOwnedSchedules(ownerId: string): Promise<void> {
 
 /**
  * Startup/lifecycle reconciliation. Only active remixlets with both manifest
- * declaration and durable grant are passed as authorized owners.
+ * declaration and durable grant are passed as authorized owners, and
+ * snapshotOwnerIds must list the owners that existed when the caller read the
+ * facts behind that judgment — take both at the same point. The deletion below
+ * runs later, behind the serialized mutation chain, against whatever the state
+ * holds by then; judging an owner registered in between by facts that predate
+ * it would delete a registration whose page holds a successful reply (the menu
+ * reconciler had exactly this bug — wiki/design/menu-reconcile-race.md). An
+ * owner missing from the snapshot keeps until the next reconcile, which reads
+ * its own facts.
  */
-export async function reconcileScheduleOwners(authorizedOwnerIds: ReadonlySet<string>): Promise<void> {
+export async function reconcileScheduleOwners(
+  authorizedOwnerIds: ReadonlySet<string>,
+  snapshotOwnerIds: ReadonlySet<string>,
+): Promise<void> {
   const removed: string[] = [];
   await mutateState((state) => {
     for (const ownerId of Object.keys(state.owners)) {
+      if (!snapshotOwnerIds.has(ownerId)) continue;
       if (authorizedOwnerIds.has(ownerId)) continue;
       delete state.owners[ownerId];
       removed.push(ownerId);
@@ -381,10 +393,9 @@ async function executeAction(ownerId: string, action: ScheduleAction): Promise<v
 async function ownerHasScheduleAuthority(ownerId: string): Promise<boolean> {
   const remixlet = (await readMirror()).find((candidate) => candidate.id === ownerId);
   if (!remixlet?.capabilities.includes("schedule")) return false;
-  const stored = await ext.storage.local.get(CAPABILITY_GRANTS_KEY);
-  // SAFETY: capability grants are written by the worker's capability-grant store as string arrays.
-  const grants = stored[CAPABILITY_GRANTS_KEY] as Record<string, string[]> | undefined;
-  return grants?.[ownerId]?.includes("schedule") ?? false;
+  // Re-check against the stored artifact itself — the approval record — not
+  // just the derived mirror (activation.ts, hasCapabilityGrant).
+  return hasCapabilityGrant(ownerId, "schedule");
 }
 
 async function enqueueHook(ownerId: string, hook: string): Promise<void> {

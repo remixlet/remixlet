@@ -20,7 +20,8 @@ const reasons = module.PLATFORM_REASON_COPY;
 
 const targets = ["chrome", "firefox", "safari"];
 const features = [
-  "userScripts",
+  "box",
+  "pageProbes",
   "sidePanel",
   "panelSurface",
   "dnr",

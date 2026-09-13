@@ -104,6 +104,32 @@ export async function reconcileNetRules(
   return run;
 }
 
+/**
+ * Delete-forever's network step. Serialised behind the reconcile queue so no
+ * concurrent reconcile can re-allocate the range mid-release. Rules first,
+ * then the allocation: the reconciler identifies owned rules THROUGH the
+ * allocation map, so releasing the slot before its rules are gone would
+ * orphan them where nothing could remove them again. By the time this runs
+ * the mirror build has already reconciled without the artifact (its rules are
+ * gone); the explicit removal here makes the step correct on its own, so a
+ * resumed deletion after a worker death needs no particular order of events.
+ */
+export async function releaseNetRuleAllocation(remixletId: string): Promise<void> {
+  const run = reconciliationQueue.then(async () => {
+    const allocations = await readAllocations();
+    const allocation = allocations[remixletId];
+    if (allocation === undefined) return;
+    const owned = (await getDynamicRules())
+      .filter((rule) => inRange(rule.id, allocation))
+      .map((rule) => rule.id);
+    if (owned.length > 0) await updateDynamicRules(owned, []);
+    delete allocations[remixletId];
+    await ext.storage.local.set({ [ALLOCATIONS_KEY]: allocations });
+  });
+  reconciliationQueue = run.catch(() => {});
+  return run;
+}
+
 async function reconcileNetRulesNow(
   active: { manifest: RemixletManifest; files: Record<string, string> }[],
   pausedSiteKeys: readonly string[],

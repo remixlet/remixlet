@@ -1,5 +1,6 @@
-// The pi-backed AgentRuntime implementation. The ONLY module (with
-// providers.ts) that imports pi types — everything else sees src/agent/types.
+// The pi-backed AgentRuntime implementation. One of the three modules (with
+// providers.ts and model-call.ts) that import pi types — everything else sees
+// src/agent/types.
 // Version pinned deliberately; upgrades re-run the agent suite as the
 // compatibility check (wiki/design/spike-a-pi-browser.md).
 
@@ -23,7 +24,16 @@ import {
   type ToolCallInput,
 } from "./contracts.js";
 import { resolveStreamFn, toModel } from "./providers.js";
+import {
+  MODEL_ATTEMPTS,
+  MODEL_CONNECT_MS,
+  MODEL_RETRY_DELAYS_MS,
+  MODEL_STALL_MS,
+  withModelCallRetries,
+} from "./model-call.js";
 import { SafetyGateError, UserDeclinedError } from "./tool-errors.js";
+
+export { MODEL_ATTEMPTS, MODEL_CONNECT_MS, MODEL_RETRY_DELAYS_MS, MODEL_STALL_MS } from "./model-call.js";
 
 export function createAgentRuntime(config: AgentRuntimeConfig): AgentRuntime {
   const listeners = new Set<(event: AgentRuntimeEvent) => void>();
@@ -31,10 +41,20 @@ export function createAgentRuntime(config: AgentRuntimeConfig): AgentRuntime {
     for (const listener of listeners) listener(event);
   };
 
-  const streamFn = resolveStreamFn(config.endpoint, {
-    maxRetries: config.maxRetries ?? 0,
-    textVerbosity: config.textVerbosity,
-  });
+  // Every model call pi issues goes through the bounded, retrying wrapper
+  // (model-call.ts): per-attempt connect and silence budgets, a few attempts
+  // with short delays, progress reported as model_wait events. pi sees one
+  // stream per call; a failed attempt never reaches it or the session log.
+  const streamFn = withModelCallRetries(
+    resolveStreamFn(config.endpoint, { textVerbosity: config.textVerbosity }),
+    {
+      connectMs: config.modelConnectMs ?? MODEL_CONNECT_MS,
+      stallMs: config.modelStallMs ?? MODEL_STALL_MS,
+      attempts: config.modelAttempts ?? MODEL_ATTEMPTS,
+      retryDelaysMs: config.modelRetryDelaysMs ?? MODEL_RETRY_DELAYS_MS,
+    },
+    emit,
+  );
   // A conversation resumed on top of an unverified activation (its verifying
   // turn died with the runtime — see session-tail.ts) re-arms the verification
   // obligation on the first turn, so the resumed conversation cannot treat the
@@ -45,9 +65,10 @@ export function createAgentRuntime(config: AgentRuntimeConfig): AgentRuntime {
     resumedObserverRepairIds: config.session?.pendingObserverRepairIds ?? [],
   });
   // Tool calls the contract bounced (ordering violations — the tool never
-  // ran), keyed by toolCallId. pi reports them as plain error results, so this
-  // is the side channel that lets tool_end carry the distinction.
-  const bouncedToolCalls = new Set<string>();
+  // ran), keyed by toolCallId with the contract's own message. pi reports
+  // them as plain error results, so this is the side channel that lets
+  // tool_end carry the distinction and the reason the chat phrases.
+  const bouncedToolCalls = new Map<string, string>();
   // The other two not-a-breakage failure classes (tool-errors.ts), same side
   // channel: safety-gate rejections and user declines each get their own
   // tool_end flag so the chat can render them honestly instead of as failures.
@@ -61,6 +82,11 @@ export function createAgentRuntime(config: AgentRuntimeConfig): AgentRuntime {
       // Resuming: the session's sanitized context becomes the live history,
       // so transcript() (and the model) see the prior conversation.
       messages: config.session ? [...config.session.initialMessages] : [],
+      // Reasoning depth rides pi's own channel: the Agent forwards any level
+      // other than "off" to the stream as options.reasoning, and each API
+      // adapter translates it. Unset (undefined) falls back to pi's "off" —
+      // nothing is sent and the backend keeps its default.
+      thinkingLevel: config.thinkingLevel,
     },
     streamFn,
   });
@@ -145,12 +171,16 @@ export function createAgentRuntime(config: AgentRuntimeConfig): AgentRuntime {
             // pi records its synthetic aborted assistant message before
             // notifying subscribers. It contains no useful context and the
             // session deliberately skips it, so remove it from the live
-            // runtime too. This keeps the runtime reusable after Stop.
+            // runtime too. This keeps the runtime reusable after Stop. (Only
+            // the user's Stop gets here: the wrapper's own per-attempt aborts
+            // never reach pi — model-call.ts.)
             agent.state.messages = agent.state.messages.filter((candidate) => candidate !== message);
             turnAborted = true;
             emit({ kind: "turn_aborted" });
           } else if (message.stopReason === "error") {
             // Captured here, reported once: prompt() rejects with it below.
+            // A call the wrapper gave up on arrives with its counted-attempts
+            // text already composed (model-call.ts).
             turnError = message.errorMessage ?? `assistant stopped: ${message.stopReason}`;
             turnErrorFromProvider = true;
           } else {
@@ -190,18 +220,22 @@ export function createAgentRuntime(config: AgentRuntimeConfig): AgentRuntime {
       case "tool_execution_start":
         emit({ kind: "tool_start", toolCallId: event.toolCallId, toolName: event.toolName, args: event.args });
         break;
-      case "tool_execution_end":
+      case "tool_execution_end": {
+        const bounceReason = bouncedToolCalls.get(event.toolCallId);
+        bouncedToolCalls.delete(event.toolCallId);
         emit({
           kind: "tool_end",
           toolCallId: event.toolCallId,
           toolName: event.toolName,
           ok: !event.isError,
-          bounced: bouncedToolCalls.delete(event.toolCallId),
+          bounced: bounceReason !== undefined,
+          reason: bounceReason,
           gateRejected: gateRejectedToolCalls.delete(event.toolCallId),
           declined: declinedToolCalls.delete(event.toolCallId),
           details: event.result?.details,
         });
         break;
+      }
       case "turn_end":
         emit({ kind: "turn_end" });
         break;
@@ -277,7 +311,7 @@ function extractText(content: ReadonlyArray<{ type: string }>): string {
 function toPiTool(
   spec: AgentToolSpec<never>,
   contract: AgentContract,
-  bouncedToolCalls: Set<string>,
+  bouncedToolCalls: Map<string, string>,
   gateRejectedToolCalls: Set<string>,
   declinedToolCalls: Set<string>,
 ): AgentTool {
@@ -293,7 +327,7 @@ function toPiTool(
         // SAFETY: pi invokes tools only after validating params against the registered TypeBox schema.
         output = await contract.execute(spec, params as ToolCallInput, signal);
       } catch (error) {
-        if (error instanceof ContractViolationError) bouncedToolCalls.add(toolCallId);
+        if (error instanceof ContractViolationError) bouncedToolCalls.set(toolCallId, error.message);
         else if (error instanceof SafetyGateError) gateRejectedToolCalls.add(toolCallId);
         else if (error instanceof UserDeclinedError) declinedToolCalls.add(toolCallId);
         throw error;

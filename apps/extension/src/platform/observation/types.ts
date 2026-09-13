@@ -32,7 +32,8 @@ export interface CaptureRequest {
 }
 
 export type CaptureResult =
-  | { ok: true; bundle: CaptureBundle }
+  /** pageLoad: the document's page-load token read with the DOM snapshot (shared/network-ids.ts), when the backend collected one. */
+  | { ok: true; bundle: CaptureBundle; pageLoad?: string }
   | { ok: false; reason: "failed"; message: string };
 
 export interface ObservationBackend {

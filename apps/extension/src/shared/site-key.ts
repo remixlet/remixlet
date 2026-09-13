@@ -1,6 +1,15 @@
 // THE host-match + site-key module (wiki/handoff.md §8): one shared implementation
 // used by remixlet `matches`, capture grouping, and conversation tagging —
 // deliberately never two. Pure functions, no extension APIs.
+//
+// Hostnames are compared in ONE canonical spelling (hostname.ts): lowercase,
+// IDNA, no trailing dot. A page URL, a model-written match pattern and a site
+// key stored by an earlier release all reach the comparisons below through
+// that spelling, so `Example.com.` and `example.com` are one site everywhere
+// — the matcher, the pause checks, approval comparison and display.
+
+import { canonicalHostname, canonicalUrlHostname } from "./hostname.js";
+import { publicSuffixSpannedBy, spannedSuffixError } from "./public-suffix.js";
 
 /**
  * Site key: the grouping identity for captures, conversations, and manager
@@ -9,8 +18,29 @@
  * with `+`). Keys are filesystem-safe by construction (hostname charset).
  */
 export function siteKeyForUrl(url: string): string {
-  const hostname = new URL(url).hostname.toLowerCase();
+  const hostname = canonicalUrlHostname(new URL(url));
   return stripWww(hostname) || hostname;
+}
+
+/**
+ * A site key in canonical spelling: each `+` part canonicalised, parts that
+ * are not hostnames dropped (a bare `*` is kept — it names "every site"),
+ * deduplicated and sorted. Keys written by earlier releases can carry a
+ * unicode host or a trailing dot; reading them through here is the migration,
+ * and it can only ever merge two spellings of the SAME host — two different
+ * hosts never canonicalise to one name.
+ */
+export function canonicalSiteKey(siteKey: string): string {
+  const parts = new Set<string>();
+  for (const part of siteKey.split("+")) {
+    if (part === "*") {
+      parts.add("*");
+      continue;
+    }
+    const host = canonicalHostname(part);
+    if (host !== undefined) parts.add(stripWww(host) || host);
+  }
+  return [...parts].sort().join("+");
 }
 
 export function siteKeyForMatches(matches: readonly string[]): string {
@@ -55,7 +85,18 @@ export function parseMatchPattern(pattern: string): MatchPattern | undefined {
   if (pattern === "<all_urls>") return { scheme: "*", host: "*", path: "/*" };
   const match = PATTERN_RE.exec(pattern);
   if (!match) return undefined;
-  return { scheme: match[1]!, host: match[2]!.toLowerCase(), path: match[3]! };
+  const host = canonicalPatternHost(match[2]!);
+  if (host === undefined) return undefined;
+  return { scheme: match[1]!, host, path: match[3]! };
+}
+
+/** `*`, or `*.`-prefix plus a canonical hostname; undefined when the host is not one. */
+function canonicalPatternHost(raw: string): string | undefined {
+  if (raw === "*") return "*";
+  const wildcard = raw.startsWith("*.");
+  const host = canonicalHostname(wildcard ? raw.slice(2) : raw);
+  if (host === undefined) return undefined;
+  return wildcard ? `*.${host}` : host;
 }
 
 /**
@@ -74,7 +115,7 @@ export function urlMatchesPattern(url: string, pattern: string): boolean {
   }
   const scheme = target.protocol.replace(/:$/, "");
   if (parsed.scheme === "*" ? !(scheme === "http" || scheme === "https") : scheme !== parsed.scheme) return false;
-  if (!hostMatches(target.hostname.toLowerCase(), parsed.host)) return false;
+  if (!hostMatches(canonicalUrlHostname(target), parsed.host)) return false;
   return globMatches(target.pathname + target.search, parsed.path);
 }
 
@@ -92,13 +133,11 @@ export function urlMatchesAny(url: string, patterns: readonly string[]): boolean
 export function urlWithinSiteKey(url: string, siteKey: string): boolean {
   let hostname: string;
   try {
-    hostname = new URL(url).hostname.toLowerCase();
+    hostname = canonicalUrlHostname(new URL(url));
   } catch {
     return false;
   }
-  return siteKey
-    .split("+")
-    .some((part) => part.length > 0 && (hostMatches(hostname, part) || hostMatches(hostname, `*.${part}`)));
+  return ownedHosts(siteKey).some((part) => hostMatches(hostname, part) || hostMatches(hostname, `*.${part}`));
 }
 
 export function urlPaused(url: string, pausedSiteKeys: readonly string[]): boolean {
@@ -129,14 +168,37 @@ export function siteKeyPaused(siteKey: string, pausedSiteKeys: readonly string[]
   return siteKeysPausing(siteKey, pausedSiteKeys).length > 0;
 }
 
+/**
+ * Whether a remixlet keyed `remixletSiteKey` belongs to the site a chat is
+ * bound to: the two keys share a host, or one is a subdomain of the other
+ * (a remixlet keyed `soundcloud.com` belongs to a chat on m.soundcloud.com,
+ * and one keyed `m.soundcloud.com` to a chat on soundcloud.com). This is the
+ * one rule for "this site's remixlets" on the agent's side: list_remixlets
+ * lists exactly these in full and read_remixlet returns exactly these
+ * (wiki/ops/2026-09-04-security-remediation-plan.md item 7, cross-site
+ * reads), so nothing is readable that was not listed. A composite key
+ * belongs to the site of any of its parts. An all-sites remixlet (a `*`
+ * part, from `<all_urls>` or a bare `*` host) runs on every page, so it
+ * belongs to every site: the user put it there through the scope dialog,
+ * and a chat on any page may need to refine it. A chat bound to nothing
+ * (an empty key) owns nothing, all-sites remixlets included.
+ */
+export function remixletOnSite(remixletSiteKey: string, boundSiteKey: string): boolean {
+  if (ownedHosts(boundSiteKey).length === 0) return false;
+  if (canonicalSiteKey(remixletSiteKey).split("+").includes("*")) return true;
+  return siteKeyPaused(remixletSiteKey, [boundSiteKey]);
+}
+
 /** siteKeyPaused straight from match patterns — the shape the worker mirror carries. */
 export function matchesPaused(matches: readonly string[], pausedSiteKeys: readonly string[]): boolean {
   return siteKeyPaused(matchHosts(matches).join("+"), pausedSiteKeys);
 }
 
-/** Site-key parts naming a real site; `*` names none. */
+/** Site-key parts naming a real site, in canonical spelling; `*` names none. */
 function ownedHosts(siteKey: string): string[] {
-  return siteKey.split("+").filter((part) => part.length > 0 && part !== "*");
+  return canonicalSiteKey(siteKey)
+    .split("+")
+    .filter((part) => part.length > 0 && part !== "*");
 }
 
 /** Either host covering the other, `*.base` style. */
@@ -144,23 +206,21 @@ function hostsOverlap(a: string, b: string): boolean {
   return hostMatches(a, `*.${b}`) || hostMatches(b, `*.${a}`);
 }
 
-/** userScripts excludeMatches patterns that keep a paused site's pages clear. */
+/** Content-script excludeMatches patterns that keep a paused site's pages clear. */
 export function siteKeyExcludePatterns(siteKey: string): string[] {
-  return siteKey
-    .split("+")
-    .filter((part) => part.length > 0 && part !== "*")
-    .flatMap((part) => [`*://${part}/*`, `*://*.${part}/*`]);
+  return ownedHosts(siteKey).flatMap((part) => [`*://${part}/*`, `*://*.${part}/*`]);
 }
 
 /**
  * Registration-time patterns: each manifest pattern widened to its whole
- * origin (`scheme://host/*`). The browser evaluates userScripts `matches`
+ * origin (`scheme://host/*`). The browser evaluates content-script `matches`
  * only when a DOCUMENT is created, so a path-scoped pattern never fires for
  * pages that reach the path via a client-side (history.pushState) navigation
- * — the SPA case. Registration is therefore origin-wide and the injected
- * runtime gate (bridge/gate.ts) enforces the manifest's real path matches.
- * Unparseable patterns pass through untouched so registration fails exactly
- * the way it would have without widening.
+ * — the SPA case. Registration is therefore origin-wide and the manifest's
+ * real path matches are applied at runtime (the box for its files, the page
+ * agent for the relay's records; worker/injection.ts). Unparseable patterns
+ * pass through untouched so registration fails exactly the way it would have
+ * without widening.
  */
 export function originWidePatterns(patterns: readonly string[]): string[] {
   const wide: string[] = [];
@@ -170,24 +230,6 @@ export function originWidePatterns(patterns: readonly string[]): string[] {
     if (!wide.includes(next)) wide.push(next);
   }
   return wide;
-}
-
-/** Pre-parsed match pattern, JSON-embeddable in generated injection code. */
-export interface CompiledMatchPattern {
-  scheme: string;
-  host: string;
-  /** RegExp source over pathname+search — same glob semantics as globMatches. */
-  pathRe: string;
-}
-
-/** Compile patterns for the injected runtime gate; malformed ones drop out. */
-export function compileMatchPatterns(patterns: readonly string[]): CompiledMatchPattern[] {
-  return patterns.flatMap((pattern) => {
-    const parsed = parseMatchPattern(pattern);
-    return parsed === undefined
-      ? []
-      : [{ scheme: parsed.scheme, host: parsed.host, pathRe: pathGlobRegExpSource(parsed.path) }];
-  });
 }
 
 /**
@@ -265,48 +307,72 @@ export function matchesWiden(previous: readonly string[], next: readonly string[
 }
 
 /**
- * A small denylist of multi-label public suffixes a `*.`-wildcard must never
- * span — NOT the full Public Suffix List, just the shapes a hostile manifest
- * would reach for. A single-label base (a bare TLD like `com`) is refused
- * structurally by matchPatternStorageError regardless of this set.
+ * Whether EVERY match pattern stays inside one site — the activation site
+ * term (wiki/ops/2026-09-04-security-remediation-plan.md item 7). `siteKey`
+ * is the site a conversation is bound to (siteKeyForUrl of its tab), and a
+ * pattern fits when its host is that site or a subdomain of it, `www.`
+ * included. An ancestor wildcard (`*.example.com` against a binding on
+ * `mail.example.com`), an ancestor exact host, an unrelated host, an
+ * all-sites host and a malformed pattern all fail: each reaches pages the
+ * conversation was never opened on. Composite keys (`a.com+b.com`) accept a
+ * pattern inside any part; an empty key fits nothing.
  */
-const PUBLIC_SUFFIX_BASES = new Set([
-  "co.uk", "org.uk", "gov.uk", "ac.uk", "me.uk", "net.uk", "sch.uk", "nhs.uk",
-  "com.au", "net.au", "org.au", "gov.au", "edu.au", "id.au",
-  "co.jp", "or.jp", "ne.jp", "ac.jp", "go.jp",
-  "co.nz", "net.nz", "org.nz", "govt.nz",
-  "co.za", "org.za", "gov.za",
-  "com.br", "net.br", "org.br", "gov.br",
-  "com.cn", "net.cn", "org.cn", "gov.cn",
-  "co.in", "net.in", "org.in", "gov.in",
-  "co.kr", "or.kr",
-  "com.mx", "com.tr", "com.sg", "com.hk", "com.tw", "com.ar",
-  "github.io", "githubusercontent.com", "gitlab.io", "pages.dev", "workers.dev",
-  "netlify.app", "vercel.app", "web.app", "firebaseapp.com", "herokuapp.com",
-  "azurewebsites.net", "cloudfront.net", "blogspot.com",
-]);
+export function matchesWithinSite(matches: readonly string[], siteKey: string): boolean {
+  const parts = ownedHosts(siteKey);
+  if (parts.length === 0 || matches.length === 0) return false;
+  return matches.every((pattern) => {
+    const parsed = parseMatchPattern(pattern);
+    if (parsed === undefined || parsed.host === "*") return false;
+    const base = parsed.host.startsWith("*.") ? parsed.host.slice(2) : parsed.host;
+    return parts.some((part) => hostMatches(base, part) || hostMatches(base, `*.${part}`));
+  });
+}
 
 /**
  * Whether a manifest match pattern is safe to STORE. Returns an error string
- * for a malformed pattern and for a `*.`-wildcard that spans a public suffix
- * (a bare TLD like `*.com`, or a known multi-label suffix like `*.co.uk` /
- * `*.github.io`) — those hand one manifest authority over every unrelated site
- * under that suffix. `<all_urls>` and a bare `*` host are VALID here and stay
- * storable: their scope is put to the user at activation, not blocked at parse.
- * `undefined` means the pattern is allowed.
+ * for a malformed pattern (a host the canonicaliser refuses) and for a
+ * `*.`-wildcard that spans a public suffix: a bare TLD like `*.com`, a listed
+ * suffix like `*.co.il` or `*.appspot.com`, or a host with suffixes beneath it
+ * like `*.amazonaws.com` (public-suffix.ts). Those hand one manifest authority
+ * over every unrelated site under that name. `<all_urls>` and a bare `*` host
+ * are VALID here and stay storable: their scope is put to the user at
+ * activation, not blocked at parse. `undefined` means the pattern is allowed.
  */
 export function matchPatternStorageError(pattern: string): string | undefined {
-  if (pattern === "<all_urls>") return undefined;
   const parsed = parseMatchPattern(pattern);
-  if (parsed === undefined) return "not a valid match pattern (use scheme://host/path, e.g. https://example.com/*)";
-  if (parsed.host === "*") return undefined;
-  if (parsed.host.startsWith("*.")) {
+  if (parsed === undefined) return "not a valid match pattern (expected scheme://host/path, e.g. *://*.example.com/*)";
+  const spanned = wildcardSpannedSuffix(parsed.host);
+  if (spanned === undefined) return undefined;
+  return spannedSuffixError(parsed.host.slice(2), spanned, (suffix) => `*.yoursite.${suffix}`);
+}
+
+/**
+ * The public suffix a `*.`-wildcard pattern host spans, if any. A bare `*`
+ * and an exact host span nothing here (an exact host is one site).
+ */
+function wildcardSpannedSuffix(patternHost: string): string | undefined {
+  if (!patternHost.startsWith("*.")) return undefined;
+  return publicSuffixSpannedBy(patternHost.slice(2));
+}
+
+/**
+ * The wildcard bases in a manifest's `matches` that span a public suffix —
+ * empty for every manifest the write gate accepts today. Stored artifacts
+ * predate the full list (parseStoredRemixletManifest skips the storage
+ * check so the mirror can always rebuild), so activation treats a non-empty
+ * result as broad scope: the dialog says the code runs on every site under
+ * that name, and the panel never auto-approves it.
+ */
+export function matchesSpanningPublicSuffix(matches: readonly string[]): string[] {
+  const bases: string[] = [];
+  for (const pattern of matches) {
+    const parsed = parseMatchPattern(pattern);
+    if (parsed === undefined) continue;
+    const spanned = wildcardSpannedSuffix(parsed.host);
     const base = parsed.host.slice(2);
-    if (base.split(".").length < 2 || PUBLIC_SUFFIX_BASES.has(base)) {
-      return `"*.${base}" spans a public suffix, which would cover every unrelated site under it — name a specific domain such as *.yoursite.${base.split(".").at(-1)}`;
-    }
+    if (spanned !== undefined && !bases.includes(base)) bases.push(base);
   }
-  return undefined;
+  return bases;
 }
 
 function hostMatches(hostname: string, patternHost: string): boolean {

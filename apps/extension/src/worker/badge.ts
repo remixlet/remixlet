@@ -6,7 +6,8 @@
 // storage.
 
 import { ext } from "../platform/ext.js";
-import { matchesPaused, urlMatchesAny, urlPaused } from "../shared/site-key.js";
+import { runsOn } from "../shared/eligibility.js";
+import { urlPaused } from "../shared/site-key.js";
 import { readMirror } from "./injection.js";
 import { readPausedSites } from "./site-pause.js";
 
@@ -41,9 +42,8 @@ async function liveCountForUrl(url: string): Promise<number> {
   if (!/^https?:/.test(url)) return 0;
   const pausedSites = await readPausedSites();
   if (urlPaused(url, pausedSites)) return 0;
-  // A remixlet paused from one of its OTHER hosts is not live here either —
-  // the count has to agree with what injection actually registered.
-  return (await readMirror()).filter(
-    (remixlet) => urlMatchesAny(url, remixlet.matches) && !matchesPaused(remixlet.matches, pausedSites),
-  ).length;
+  // The one page-level run decision (shared/eligibility.ts) — the count has
+  // to agree with what injection actually registered, so a remixlet paused
+  // from one of its OTHER hosts is not live here either.
+  return (await readMirror()).filter((remixlet) => runsOn(remixlet, url, pausedSites)).length;
 }

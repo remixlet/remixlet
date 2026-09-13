@@ -32,14 +32,14 @@ import {
   type RemixletManifest,
 } from "../shared/remixlet.js";
 import { sanitizeVerifiedAssertions, type VerifiedAssertion } from "../shared/show-changes.js";
+import { sanitizeLookReview, type LookReview } from "../shared/look-review.js";
 import { siteKeyForMatches, siteKeyForUrl, urlMatchesAny } from "../shared/site-key.js";
 import { git, TREE } from "./git.js";
 import { isFsError, OpfsFs, type FsPromises } from "./opfs-fs.js";
 
 // "needs-attention" is system-parked: the final verification of an activation
-// failed and no verified version existed to roll back to, or the user revoked
-// a granted capability the code was built to use. It does not inject (only
-// "enabled" does) and the enable/disable toggle rejects it — the code is
+// failed and no verified version existed to roll back to. It does not inject
+// (only "enabled" does) and the enable/disable toggle rejects it — the code is
 // known broken, so flipping it on makes no sense and flipping it "off" is a
 // no-op lie. Its only exits are a fixing activation (activate() returns it to
 // "enabled" so the build/verify loop injects) or archive. Plain "disabled"
@@ -47,20 +47,6 @@ import { isFsError, OpfsFs, type FsPromises } from "./opfs-fs.js";
 // attempt on a system-parked remixlet must inject or the fix loop tests
 // nothing — the state records WHY the remixlet is off.
 export type RemixletState = "enabled" | "disabled" | "archived" | "needs-attention";
-
-/**
- * Why a remixlet was parked "needs-attention" when the cause was NOT a failed
- * verification (that story lives in lastVerifyResult). The next chat reads
- * this to pick the right fix — a revoke-park needs a rewrite without the
- * capability (or a re-request), not a verification retry.
- */
-export interface AttentionRecord {
-  kind: "capability-revoked";
-  /** The raw capability name that was revoked (e.g. "fetch:api.example.com"). */
-  capability: string;
-  /** UTC ISO date-time of the park. */
-  at: string;
-}
 
 export interface RegistryEntry {
   id: string;
@@ -89,11 +75,13 @@ export interface RegistryEntry {
    */
   lastVerifyResult?: VerifyResult;
   /**
-   * Present only while state is "needs-attention" and the park had a
-   * non-verification cause. Cleared by the park's exits: a fixing activation
-   * builds a fresh entry, and a verified pass unparks explicitly.
+   * The model's recorded look verdict for the version it names (record_look
+   * after look_at_change; wiki/design/look-review.md) — the "Visual review"
+   * section on the manager's remixlet page. Carried forward by activation like the
+   * verification marker, so its version/headSha say what it describes.
+   * Absent on entries written before 2026-09-03 (optional on read).
    */
-  attention?: AttentionRecord;
+  lookReview?: LookReview;
 }
 
 export interface VerifyResult {
@@ -158,13 +146,20 @@ export interface RemixletVersion {
   current: boolean;
 }
 
+/**
+ * One coherent read of a stored remixlet: the registry entry and the files
+ * committed at its `headSha`, with the manifest parsed from those files. The
+ * worktree is never consulted (see read()).
+ */
 export interface RemixletContent {
+  entry: RegistryEntry;
   manifest: RemixletManifest;
   files: Record<string, string>;
 }
 
 const ROOT = "/remixlets";
 const REGISTRY_DIR = `${ROOT}/.registry`;
+const LOOK_REVIEW_DIR = `${ROOT}/.look-review`;
 const REGISTRY_FILE = "registry.json";
 const AUTHOR = { name: "remixlet", email: "agent@remixlet.com" };
 
@@ -251,30 +246,68 @@ export class RemixletStore {
     // Carried forward like the verification marker: the record's own
     // version/headSha say which version the outcome describes.
     if (previous?.lastVerifyResult) entry.lastVerifyResult = { ...previous.lastVerifyResult };
+    if (previous?.lookReview) entry.lookReview = { ...previous.lookReview };
     await this.#updateRegistry(entry);
     return entry;
     });
   }
 
-  async read(id: string): Promise<RemixletContent> {
-    return this.#inspect(async () => {
-    const dir = `${ROOT}/${id}`;
-    const files: Record<string, string> = {};
-    for (const name of await this.#trackedFiles(dir)) {
-      // SAFETY: readFile's utf8 overload resolves to a string.
-      files[name] = (await this.#fs.readFile(`${dir}/${name}`, "utf8")) as string;
-    }
-    const manifestJson = files[MANIFEST_FILE];
-    if (manifestJson === undefined) throw new Error(`remixlet ${id} has no ${MANIFEST_FILE}`);
-    return { manifest: parseStoredRemixletManifest(manifestJson), files };
+  /**
+   * Record the model's look verdict for the CURRENT version (record_look,
+   * wiki/design/look-review.md). Stored beside the verification marker; a
+   * malformed review is rejected, never half-stored. Replaces any earlier
+   * review: only the latest look describes the live code.
+   */
+  async recordLookReview(id: string, input: LookReview): Promise<RegistryEntry> {
+    return this.#mutate(async () => {
+      const entry = await this.#mustGetEditable(id);
+      const review = sanitizeLookReview({ ...input, reviewedAt: validatedIsoDate(input.reviewedAt) });
+      if (!review) throw new Error("look review is malformed");
+      review.version = entry.version;
+      review.headSha = entry.headSha;
+      entry.lookReview = review;
+      await this.#updateRegistry(entry);
+      return entry;
     });
   }
 
-  async readFile(id: string, file: string): Promise<string> {
+  /**
+   * The subject crop the model looked at, latest only, kept outside both git
+   * repos (the remixlet's worktree and the registry) so it is never committed
+   * or diffed. A missing file is an ordinary "no crop" answer.
+   */
+  async writeLookCrop(id: string, png: Uint8Array): Promise<void> {
+    assertSafeFileName(id);
+    await this.#fs.writeFile(`${LOOK_REVIEW_DIR}/${id}.png`, png);
+  }
+
+  async readLookCrop(id: string): Promise<Uint8Array | undefined> {
+    assertSafeFileName(id);
+    try {
+      const bytes = await this.#fs.readFile(`${LOOK_REVIEW_DIR}/${id}.png`);
+      return bytes instanceof Uint8Array ? bytes : undefined;
+    } catch (error) {
+      if (isFsError(error, "ENOENT")) return undefined;
+      throw error;
+    }
+  }
+
+  /**
+   * The committed read every authorization decision is made from: the files
+   * at the registry entry's `headSha`, never the worktree. The worktree is a
+   * staging area (activate and rollback rewrite it before committing); an
+   * interrupted activation or anything else that touches those files must
+   * not change what counts as approved or what gets injected
+   * (wiki/ops/2026-09-04-security-remediation-plan.md item 10). An
+   * unregistered id has no committed identity and reads as unknown.
+   */
+  async read(id: string): Promise<RemixletContent> {
     return this.#inspect(async () => {
-      assertSafeFileName(file);
-      // SAFETY: readFile's utf8 overload resolves to a string.
-      return (await this.#fs.readFile(`${ROOT}/${id}/${file}`, "utf8")) as string;
+      const entry = await this.#mustGet(id);
+      const files = await this.#filesAt(`${ROOT}/${id}`, entry.headSha);
+      const manifestJson = files[MANIFEST_FILE];
+      if (manifestJson === undefined) throw new Error(`remixlet ${id} has no ${MANIFEST_FILE}`);
+      return { entry, manifest: parseStoredRemixletManifest(manifestJson), files };
     });
   }
 
@@ -352,12 +385,8 @@ export class RemixletStore {
     if (input.conversationId) entry.lastVerifyResult.conversationId = input.conversationId;
     // A pass on the live version is the ordinary fixing exit from a system
     // park (the fixing activation already returned it to "enabled"); if the
-    // park somehow outlived it, the verified code must not stay parked — and
-    // the park's cause record goes with it.
-    if (entry.state === "needs-attention") {
-      entry.state = "enabled";
-      delete entry.attention;
-    }
+    // park somehow outlived it, the verified code must not stay parked.
+    if (entry.state === "needs-attention") entry.state = "enabled";
     await this.#updateRegistry(entry);
     return verification;
     });
@@ -388,17 +417,13 @@ export class RemixletStore {
   /**
    * System park: stops injection while keeping code and history. Entered by
    * the failed-exit cleanup (a failed final verification with no verified
-   * version to roll back to — no `attention` record; lastVerifyResult carries
-   * the story) and by a user capability revoke (which passes the record so
-   * the next chat knows which fix applies). activate() and archive are its
-   * only exits.
+   * version to roll back to — lastVerifyResult carries the story).
+   * activate() and archive are its only exits.
    */
-  async parkNeedsAttention(id: string, attention?: AttentionRecord): Promise<RegistryEntry> {
+  async parkNeedsAttention(id: string): Promise<RegistryEntry> {
     return this.#mutate(async () => {
       const entry = await this.#mustGetEditable(id);
       entry.state = "needs-attention";
-      if (attention) entry.attention = { ...attention, at: validatedIsoDate(attention.at) };
-      else delete entry.attention;
       await this.#updateRegistry(entry);
       return entry;
     });
@@ -451,6 +476,11 @@ export class RemixletStore {
     return this.#mutate(async () => {
       const entry = await this.#mustGet(id);
       await this.#removeDirTree(`${ROOT}/${id}`);
+      try {
+        await this.#fs.unlink(`${LOOK_REVIEW_DIR}/${id}.png`);
+      } catch (error) {
+        if (!isFsError(error, "ENOENT")) throw error;
+      }
       await this.#removeFromRegistry(entry);
     });
   }
@@ -464,7 +494,6 @@ export class RemixletStore {
       };
       if (entry.lastVerifiedAgainst) restored.lastVerifiedAgainst = { ...entry.lastVerifiedAgainst };
       if (entry.lastVerifyResult) restored.lastVerifyResult = { ...entry.lastVerifyResult };
-      if (entry.attention) restored.attention = { ...entry.attention };
       await this.#updateRegistry(restored);
     });
   }

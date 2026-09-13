@@ -15,24 +15,6 @@
 
 @custom-variant dark (&:is(.dark *));
 
-/* Syntax colors for the script-approval preview (shiki's css-variables theme,
-   src/panel/script-code.tsx). Everything maps onto brand tokens, so dark mode
-   follows the .dark palette with no extra rules. */
-:root {
-  --shiki-foreground: var(--ink);
-  --shiki-token-comment: var(--muted);
-  --shiki-token-keyword: var(--accent);
-  --shiki-token-function: var(--accent);
-  --shiki-token-string: var(--signal);
-  --shiki-token-string-expression: var(--signal);
-  /* "constant" catches every const-declared identifier, not just literals —
-     the default ink keeps the preview from drowning in accent color. */
-  --shiki-token-constant: var(--ink);
-  --shiki-token-parameter: var(--ink);
-  --shiki-token-punctuation: var(--muted);
-  --shiki-token-link: var(--accent);
-}
-
 /* Categorical series colors for the dashboard's Tremor charts
    (src/components/charts/). Slot ORDER is the colorblind-safety mechanism —
    adjacent pairs were validated per mode (CVD ΔE ≥ 8, normal-vision ≥ 15);

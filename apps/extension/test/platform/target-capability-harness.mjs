@@ -2,6 +2,12 @@ import * as esbuild from "esbuild";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
+// The worker graph under test reaches the store (schedule -> activation -> RemixletStore),
+// which bundles isomorphic-git and its CommonJS deps. Those call require() at
+// load, and an ESM data: URL has none, so the bundle gets one rooted at this
+// file (createRequire needs a file URL, not the data: URL).
+const requireShim = `import { createRequire as __createRequire } from "node:module"; const require = __createRequire(${JSON.stringify(import.meta.url)});`;
+
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..");
 
 export async function assertTargetCapabilityGates(target) {
@@ -25,6 +31,7 @@ export async function assertTargetCapabilityGates(target) {
     write: false,
     format: "esm",
     platform: "node",
+    banner: { js: requireShim },
     define: { __BROWSER_TARGET__: JSON.stringify(target) },
   });
   const source = result.outputFiles[0].text;
@@ -33,8 +40,10 @@ export async function assertTargetCapabilityGates(target) {
 
   assert(capabilities.target === target, `${target}: target identity`);
   if (target === "firefox") {
-    assert(capabilities.userScriptsSetup === "permission", "Firefox: userScripts uses a real optional-permission path");
-    assertSpecificReason(capabilities.disabledReasons.userScripts, "Firefox: locked userScripts reason");
+    assert(capabilities.box === false, "Firefox: no offscreen document, so no box for JavaScript remixlets");
+    assertSpecificReason(capabilities.disabledReasons.box, "Firefox: box reason");
+    assert(capabilities.pageProbes === false, "Firefox fake without scripting.executeScript: page probes off");
+    assertSpecificReason(capabilities.disabledReasons.pageProbes, "Firefox: page-probe reason");
     assert(capabilities.sidePanel === false && capabilities.panelSurface === "sidebar", "Firefox: sidebar fallback selected");
     assertSpecificReason(capabilities.disabledReasons.sidePanel, "Firefox: side-panel fallback reason");
     assert(capabilities.dnr && capabilities.dnrRegexSubstitution, "Firefox: documented DNR regex redirects enabled");
@@ -58,8 +67,10 @@ export async function assertTargetCapabilityGates(target) {
     return;
   }
 
-  assert(capabilities.userScriptsSetup === "unsupported", "Safari: generated JavaScript is unavailable");
-  assertSpecificReason(capabilities.disabledReasons.userScripts, "Safari: JavaScript reason");
+  assert(capabilities.box === false, "Safari: generated JavaScript is unavailable (no box host)");
+  assertSpecificReason(capabilities.disabledReasons.box, "Safari: JavaScript reason");
+  assert(capabilities.pageProbes === false, "Safari fake without scripting.executeScript: page probes off");
+  assertSpecificReason(capabilities.disabledReasons.pageProbes, "Safari: page-probe reason");
   assert(capabilities.sidePanel === false && capabilities.panelSurface === "popup", "Safari: popup fallback selected");
   assertSpecificReason(capabilities.disabledReasons.sidePanel, "Safari: side-panel fallback reason");
   assert(capabilities.dnr && !capabilities.dnrRegexSubstitution, "Safari: fixed DNR only");
@@ -105,7 +116,7 @@ function fakeExtensionApi(target) {
       id: "capability-contract",
       getManifest: () => ({
         permissions: ["declarativeNetRequest", "webNavigation", "tabs", "alarms"],
-        optional_permissions: target === "firefox" ? ["userScripts"] : [],
+        optional_permissions: [],
       }),
       getURL: (value) => `chrome-extension://capability-contract/${value}`,
     },
@@ -114,6 +125,7 @@ function fakeExtensionApi(target) {
       request: async () => false,
     },
     scripting: {},
+    storage: { local: fakeStorageArea() },
     tabs: {
       captureVisibleTab: async () => "data:image/png;base64,",
     },
@@ -136,6 +148,29 @@ function fakeExtensionApi(target) {
       getAll: async () => [],
       update: async (id) => ({ id }),
       create: async () => ({ id: 1 }),
+    },
+  };
+}
+
+// worker/activation.ts clears its legacy grant keys at module evaluation (a
+// worker-boot side effect), so loading the bundle needs a storage area, not
+// just the APIs the capability gates probe.
+function fakeStorageArea() {
+  const items = new Map();
+  return {
+    get: async (keys) => {
+      if (keys === undefined || keys === null) return Object.fromEntries(items);
+      if (typeof keys === "string") keys = [keys];
+      const defaults = Array.isArray(keys) ? {} : keys;
+      const wanted = Array.isArray(keys) ? keys : Object.keys(keys);
+      const found = wanted.filter((key) => items.has(key)).map((key) => [key, items.get(key)]);
+      return { ...defaults, ...Object.fromEntries(found) };
+    },
+    set: async (values) => {
+      for (const [key, value] of Object.entries(values)) items.set(key, value);
+    },
+    remove: async (keys) => {
+      for (const key of Array.isArray(keys) ? keys : [keys]) items.delete(key);
     },
   };
 }

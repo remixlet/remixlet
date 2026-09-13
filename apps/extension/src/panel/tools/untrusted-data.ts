@@ -4,8 +4,7 @@
 
 /**
  * Every page-derived value the model sees is framed as untrusted data. Shared
- * by all probes and the evaluate_js escape hatch so the framing text cannot
- * drift between tools.
+ * by all probes so the framing text cannot drift between tools.
  */
 export function frameUntrustedPageData(value: string): string {
   return (

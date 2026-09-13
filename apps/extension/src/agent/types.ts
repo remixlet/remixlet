@@ -43,8 +43,24 @@ export interface AgentToolOutput {
 }
 
 /**
- * Provider endpoint description. `baseUrl` is always explicit — settings
- * (`remixletEndpoint`) can point any provider at a mock or proxy (wiki/handoff.md §3).
+ * Reasoning depth for models that take one, in pi's provider-neutral
+ * vocabulary — each pi API adapter translates it to that provider's own dial
+ * (effort string, token budget). Which levels a given model accepts is model
+ * metadata, not this union: the Codex manifest names them per model, and the
+ * pi catalog's `reasoning` flag gates the rest. Absent means "send nothing"
+ * and the backend applies its own default.
+ */
+export const THINKING_LEVELS = ["minimal", "low", "medium", "high", "xhigh", "max"] as const;
+export type ThinkingLevel = (typeof THINKING_LEVELS)[number];
+
+export function isThinkingLevel(value: string): value is ThinkingLevel {
+  return THINKING_LEVELS.some((level) => level === value);
+}
+
+/**
+ * Provider endpoint description. `baseUrl` is always explicit. API-key
+ * provider settings can point at a mock or proxy; normalized Codex settings
+ * always use the official ChatGPT backend (wiki/handoff.md §3).
  * Only APIs proven browser-clean are admitted here; which API a given
  * provider/model pair speaks is the catalog's call (provider-catalog.ts
  * `endpointPlan`), not the panel's.
@@ -54,7 +70,10 @@ export interface AgentToolOutput {
  *
  * Codex: auth is a callback, not a stored key — access tokens expire and
  * rotate, so the provider fetches a fresh one from the worker per model call
- * (the worker refreshes single-flight behind it).
+ * (the worker refreshes single-flight behind it). `thinkingLevels` is the
+ * model's manifest-declared reasoning dial (already intersected with
+ * THINKING_LEVELS at discovery); toModel() turns it into the pi
+ * thinkingLevelMap that marks everything else unsupported.
  */
 export type ProviderEndpoint =
   | {
@@ -71,20 +90,42 @@ export type ProviderEndpoint =
       modelId: string;
       getAccessToken: () => Promise<string>;
       vision?: boolean;
+      thinkingLevels?: readonly ThinkingLevel[];
     };
 
 export interface AgentRuntimeConfig {
   systemPrompt: string;
   endpoint: ProviderEndpoint;
   tools: AgentToolSpec<never>[];
-  /** Provider retry cap. Tests use 0; product default lives in the runtime. */
-  maxRetries?: number;
+  /**
+   * Budgets for one model call (src/agent/model-call.ts owns them; defaults
+   * MODEL_CONNECT_MS, MODEL_STALL_MS, MODEL_ATTEMPTS, MODEL_RETRY_DELAYS_MS).
+   * A request whose headers never arrive, or a stream that goes quiet, used to
+   * wait until the user pressed Stop (the 2026-09-05 soundcloud run). Now each
+   * attempt has a connect budget (request issued → response headers) and a
+   * silence budget (longest gap between stream events); an attempt that
+   * overruns either, or fails in a way that looks transient, is retried after
+   * a short delay with the same context, and the turn rejects as a
+   * ProviderTurnError only once every attempt is spent. Tests shorten them.
+   */
+  modelConnectMs?: number;
+  modelStallMs?: number;
+  modelAttempts?: number;
+  /** Delay before attempt 2, 3, …; the last entry repeats. */
+  modelRetryDelaysMs?: readonly number[];
   /**
    * Response-length hint for endpoints that take one per request (today only
    * the ChatGPT-subscription backend; other APIs ignore it). Derived from the
    * chat verbosity preference — see shared/chat-preferences.ts.
    */
   textVerbosity?: "low" | "medium" | "high";
+  /**
+   * Reasoning depth for the whole conversation, from the per-model setting
+   * (shared/settings.ts). Omitted ⇒ nothing is sent and the backend applies
+   * its own default — reasoning models spend real seconds here, so an
+   * explicit level is the main latency dial (wiki/design/agent-latency.md).
+   */
+  thinkingLevel?: ThinkingLevel;
   /**
    * Persist and resume this conversation (JSONL on OPFS). Open one with
    * ConversationSession.open(id); omit for an ephemeral runtime. Opaque to
@@ -144,13 +185,40 @@ export type AgentRuntimeEvent =
       toolName: string;
       ok: boolean;
       bounced?: boolean;
+      /**
+       * A bounced call's own text (the contract's message). The chat phrases
+       * it in plain words (panel/chat-phrases.tsx bouncePhrase) and never
+       * shows it raw.
+       */
+      reason?: string;
       /** A pre-activation safety review sent the write back (tool-errors.ts). */
       gateRejected?: boolean;
       /** The user declined the approval this step asked for. */
       declined?: boolean;
       details?: unknown;
     }
+  | ModelWaitEvent
   | { kind: "turn_end" };
+
+/**
+ * Progress of one model call, so the panel can show the wait instead of a
+ * silent spinner. Emitted when the request is issued (`connecting`), when
+ * response headers arrive (`streaming`), about once a second while either
+ * phase lasts, when an attempt is given up and the next one is about to start
+ * (`retrying`, with the plain-words reason), and once when the call settles
+ * (`done`: answered, failed for good, or stopped by the user). `elapsedMs`
+ * counts from the first attempt; `silenceMs` is how long the current attempt
+ * has heard nothing from the model.
+ */
+export interface ModelWaitEvent {
+  kind: "model_wait";
+  phase: "connecting" | "streaming" | "retrying" | "done";
+  attempt: number;
+  maxAttempts: number;
+  elapsedMs: number;
+  silenceMs: number;
+  reason?: string;
+}
 
 export interface TranscriptEntry {
   role: "user" | "assistant";

@@ -2,20 +2,33 @@
 // in shared/ because every layer that handles the version may import shared/
 // and nothing else in common: shared/remixlet.ts validates the manifest stamp,
 // the write tool (panel/tools) authors it, the worker's mirror build compares
-// it against the running bridge, and bridge/rmx.ts is the contract it
+// it against the running bridge, and box/runtime.ts is the contract it
 // describes (that module's header states the change discipline).
 
-/** The rmx.* contract version this build of the extension provides. */
-export const RMX_BRIDGE_VERSION = 1;
+/**
+ * The rmx.* contract version this build of the extension provides. Version 2
+ * is the box (wiki/design/mediated-execution.md) with the mark rule
+ * (wiki/decisions/leftover-marks.md): remixlet code runs in a sandboxed
+ * extension page, reaches the document only through the async `dom` API, and
+ * every attribute or class it writes on the page's own elements carries its
+ * prefix. Version 2 narrowed what the `dom` API grants rather than adding to
+ * it (wiki/ops/2026-09-12-security-review-plan.md, F2): a `network:observe:`
+ * grant no longer admits a URL, an off-site image or link URL must be one the
+ * page already loads exactly as written rather than merely on a host it loads
+ * from, and a password field's value is never read back. Pre-launch there is
+ * one version and no history: a breaking change before launch renumbers
+ * nothing but bumps this so stored dev artifacts surface as needs-repair;
+ * after launch a bump is a decision record
+ * (wiki/decisions/launch-backwards-compatibility.md).
+ */
+export const RMX_BRIDGE_VERSION = 2;
 
 /**
  * The oldest builtWith.bridge stamp this build still runs. Raised only when a
- * breaking bridge change truly cannot serve old remixlets. Today it equals
- * RMX_BRIDGE_VERSION, so no stored remixlet can actually be skewed — the
- * detection below exists NOW so the first breaking change finds it already
- * wired and tested instead of shipping the hazard and the guard together.
+ * breaking bridge change truly cannot serve old remixlets; an artifact below
+ * it is quarantined by the mirror build and surfaces as needs-repair.
  */
-export const RMX_BRIDGE_MIN_SUPPORTED = 1;
+export const RMX_BRIDGE_MIN_SUPPORTED = 2;
 
 /**
  * The manifest's record of what the remixlet was built against. Extension-
@@ -44,11 +57,14 @@ export interface RemixletBuiltWith {
  * Running skewed code would fail in undefined ways on the user's page (calls
  * into methods that no longer exist or now behave differently), so the caller
  * routes a non-undefined reason into the needs-repair treatment instead of
- * injecting. A manifest without the stamp predates it; every bridge that
- * existed then was version 1, so absence reads as 1 and needs no migration.
+ * injecting. The stamp is written on every save, so a manifest without one
+ * was written before the box existed and is refused outright.
  */
 export function bridgeSkewReason(builtWith: RemixletBuiltWith | undefined): string | undefined {
-  const built = builtWith?.bridge ?? 1;
+  if (builtWith === undefined) {
+    return `carries no rmx bridge stamp, so it predates the box (this extension provides v${RMX_BRIDGE_VERSION})`;
+  }
+  const built = builtWith.bridge;
   if (built > RMX_BRIDGE_VERSION) {
     return `built against rmx bridge v${built}, but this extension provides v${RMX_BRIDGE_VERSION}`;
   }

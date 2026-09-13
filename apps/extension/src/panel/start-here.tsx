@@ -25,7 +25,7 @@ export type ActivePage =
   | { kind: "no-tab" }
   /** The active tab is a browser or extension page — remixlets cannot run there. */
   | { kind: "not-web" }
-  | { kind: "web"; siteKey: string; favIconUrl?: string };
+  | { kind: "web"; siteKey: string; origin: string; favIconUrl?: string };
 
 async function readActivePage(): Promise<ActivePage> {
   const target = await resolveActiveBrowserTab();
@@ -33,7 +33,7 @@ async function readActivePage(): Promise<ActivePage> {
   // Extension pages, chrome://, about: — no site, and nothing to remix.
   if (!/^https?:/.test(target.url)) return { kind: "not-web" };
   const tab = await ext.tabs.get(target.id).catch(() => undefined);
-  return { kind: "web", siteKey: siteKeyForUrl(target.url), favIconUrl: tab?.favIconUrl };
+  return { kind: "web", siteKey: siteKeyForUrl(target.url), origin: new URL(target.url).origin, favIconUrl: tab?.favIconUrl };
 }
 
 /** Live view of the active tab, shared by the empty state and the composer gate. */
@@ -87,7 +87,7 @@ export function StartHere({ page }: { page: ActivePage }) {
               blocks the tab's live favicon URL outright, so this slot renders
               the worker's data-URL snapshot and kicks off the capture itself
               rather than waiting for a chat to bind. */}
-          <SiteIcon eager siteKey={page.siteKey} favIconUrl={page.favIconUrl} className="size-4" />
+          <SiteIcon eager siteKey={page.siteKey} pageOrigin={page.origin} favIconUrl={page.favIconUrl} className="size-4" />
           <span id="start-here-site" className="min-w-0 truncate text-[15px] leading-5 font-semibold tracking-[-0.01em]">
             {page.siteKey}
           </span>

@@ -44,7 +44,7 @@ import {
 
 const SHOW_CHANGES_HOST_ID = "remixlet-extension-show-changes";
 /** Extension-owned hosts a stored selector must never highlight. */
-const EXTENSION_HOST_IDS = [SHOW_CHANGES_HOST_ID, "remixlet-extension-drawer", "remixlet-extension-annotate"];
+const EXTENSION_HOST_IDS = [SHOW_CHANGES_HOST_ID, "remixlet-extension-annotate"];
 /** Padding (px) added around a matched element's rect, like annotate's snap. */
 const PAD_PX = 6;
 /** Boxes per mark when a count assertion targets many elements. */
@@ -74,7 +74,7 @@ interface ResolvedSpots {
 /**
  * Re-resolve the stored assertions against the live DOM. Assertions sharing a
  * selector collapse into one mark (a control typically carries visible +
- * design-parity + not-clipped together — three labels, one box).
+ * visible + not-clipped together — two labels, one box).
  */
 function resolveSpots(assertions: VerifiedAssertion[]): ResolvedSpots {
   const groups = new Map<string, VerifiedAssertion[]>();

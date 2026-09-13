@@ -46,7 +46,6 @@ tasks:
     desc: Run the shipped platform contract checks (see TESTING.md)
     cmds:
       - task: test:capabilities
-      - task: test:user-scripts-gate
       - task: test:chrome
       - task: test:firefox
       - task: test:safari
@@ -56,12 +55,6 @@ tasks:
     dir: apps/extension
     cmds:
       - pnpm test:capabilities
-
-  test:user-scripts-gate:
-    desc: Which unlock Chrome asks for (Developer mode vs toggle), and that a revoked script lane stops reporting itself as available
-    dir: apps/extension
-    cmds:
-      - pnpm test:user-scripts-gate
 
   test:chrome:
     desc: Chrome manifest and platform capability-gate contracts

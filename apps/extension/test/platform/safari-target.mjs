@@ -35,7 +35,7 @@ assert(permissions.has("declarativeNetRequest"), "supported DNR rules remain ava
 assert(!permissions.has("notifications"), "Safari-unsupported notifications permission is absent");
 assert(!optionalPermissions.has("pageCapture"), "Chrome MHTML escalation is absent");
 assert(worker.includes("JavaScript remixlets are unavailable in Safari"), "JS activation has an explicit disabled reason");
-assert(worker.includes("Safari limited mode"), "Safari boots the CSS/DNR mirror in limited mode");
+assert(worker.includes("limited mode"), "Safari boots the CSS/DNR mirror in limited mode");
 assert(worker.includes("Safari capture is limited to the visible viewport"), "capture degradation is explicit");
 assert(worker.includes("panel/index.html"), "popup PanelSurface includes the shared panel");
 assert(worker.includes("targetWindowId: existing.id"), "existing Safari panel popup reports its actual window");

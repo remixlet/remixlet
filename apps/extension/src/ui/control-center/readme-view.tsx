@@ -11,15 +11,6 @@ import remarkGfm from "remark-gfm";
 import { README_FILE } from "../../shared/remixlet.js";
 import { send } from "./send.js";
 
-// READMEs written before the heading format open each section with an inline
-// bold label ("**Intent** — what was asked…"), which renders as four dense
-// paragraphs. Stored remixlets keep that file until their next rewrite, so
-// lift the known labels into the "## " headings the current format specifies
-// and every README renders with the same eyebrow structure.
-function liftLegacySectionLabels(readme: string): string {
-  return readme.replace(/^\*\*(Intent|Behavior|Assumptions|Decisions)\*\*[ \t]*(?:[—–:-][ \t]+)?/gm, "## $1\n\n");
-}
-
 export function ReadmeView({ id, sha }: { id: string; sha: string }) {
   const [files, setFiles] = useState<Record<string, string> | undefined>(undefined);
   const [error, setError] = useState<string | undefined>(undefined);
@@ -30,7 +21,7 @@ export function ReadmeView({ id, sha }: { id: string; sha: string }) {
   }, [id, sha]);
   if (error !== undefined) return <p className="text-xs text-destructive">Couldn’t load the README: {error}</p>;
   if (!files) return <p className="text-xs text-muted-foreground">Loading…</p>;
-  const readme = liftLegacySectionLabels(files[README_FILE]?.trim() ?? "");
+  const readme = files[README_FILE]?.trim() ?? "";
   if (readme === "") {
     return (
       <p className="readme-missing text-sm text-muted-foreground">

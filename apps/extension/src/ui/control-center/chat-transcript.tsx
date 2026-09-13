@@ -30,13 +30,14 @@ function messageFor(entry: ConversationLogEntry): TranscriptMessage | undefined 
       return entry.text.length > 0 ? transcriptMessage({ kind: "assistant", text: entry.text }) : undefined;
     case "tool_result": {
       // Same settling logic as the live chat; failed steps are classified
-      // from the recorded result text, so bounces stay dropped and gate
-      // rejections/declines keep their calm rows on replay too.
+      // from the recorded result text, so bounces keep their plain-words
+      // held rows and gate rejections/declines their calm rows on replay too.
       const phrase = describeTool(entry.toolName, undefined);
       const failure = entry.ok ? undefined : classifyToolFailure(entry.text);
       return settledToolMessage(entry.toolName, phrase, {
         ok: entry.ok,
         bounced: failure === "bounced",
+        reason: failure === "bounced" ? entry.text : undefined,
         gateRejected: failure === "gate",
         declined: failure === "declined",
         details: entry.details,

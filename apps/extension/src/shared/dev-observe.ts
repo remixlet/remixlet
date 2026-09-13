@@ -17,12 +17,6 @@ export interface DevObserveGrant {
    * navigation mid-conversation cannot carry broad observation elsewhere.
    */
   origin: string;
-  /**
-   * Names the observer's DOM sync events. Embedded in MAIN-world code, so the
-   * page can read it — like relayToken it is a namespace, never authority
-   * (the buffer only ever holds the page's own responses).
-   */
-  token: string;
   grantedAt: number;
 }
 
@@ -30,8 +24,8 @@ export interface DevObserveGrant {
 export const DEV_OBSERVE_GRANTS_KEY = "devObserveGrants";
 
 /**
- * Backstop expiry for a panel that dies without a close event (the Arc
- * drawer-reload shape): reconcile drops the registration once the record
+ * Backstop expiry for a panel that dies without a close event (killed with
+ * the browser window): reconcile drops the registration once the record
  * expires. Long enough for a real build conversation; a stale observer is a
  * hygiene cost (patched fetch + buffer memory), never a data leak — it buffers
  * the page's own responses in the page's own world.
@@ -59,16 +53,18 @@ export function devObserveGrantAuthorizes(
 }
 
 /**
- * Sync-event names for the buffer read (the relay-sync pattern: the probe
- * dispatches the request event with a JSON-string detail, the observer answers
- * with the reply event synchronously during dispatch). The worker passes the
- * FULL event names into the probe template as server-injected params, so the
- * template never re-derives them — these helpers are the single authority.
+ * The buffer read's DOM-event contract (the relay-sync pattern): the probe
+ * dispatches the request event on `document` with a JSON-string detail
+ * `{ urlFilter?: string, limit?: number }`, and the observer answers with the
+ * reply event synchronously during that dispatch, detail JSON
+ * `{ total, matched, recorded, entries }` where entries are the observer's
+ * newest `limit` matching records `{ seq, url, method, status, contentType,
+ * body, truncated }`. Constant names: the observer is a shipped file
+ * (bridge/dev-observe.ts) and can be handed no per-grant token; the worker
+ * still passes both names into the probe as server-injected params, after
+ * the grant gate, so the template never re-derives them. The probe runs from
+ * the ISOLATED world through probes.js; this pair did not change with it.
  */
-export function devObserveRequestEventName(token: string): string {
-  return `rmx-devobs-req:${token}`;
-}
+export const DEV_OBSERVE_REQUEST_EVENT = "rmx-devobs-req";
 
-export function devObserveReplyEventName(token: string): string {
-  return `rmx-devobs-rep:${token}`;
-}
+export const DEV_OBSERVE_REPLY_EVENT = "rmx-devobs-rep";

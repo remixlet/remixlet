@@ -25,9 +25,8 @@ const VerificationDetails = Type.Object(
 /**
  * Durable "last verified" metadata is stronger than agent-loop completion.
  * The loop's post-write gate requires an assert_page_state RUN (contracts.ts);
- * only a run whose assertions ALL passed can make this durable claim.
- * evaluate_js deliberately cannot: a human-approved freeform script must not
- * silently mint verification records — assertions are the explicit lane.
+ * only a run whose assertions ALL passed can make this durable claim. No
+ * other tool can, whatever its details say: assertions are the explicit lane.
  */
 export function explicitVerificationRecord(
   event: AgentRuntimeEvent,

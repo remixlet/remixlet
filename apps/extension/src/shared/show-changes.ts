@@ -20,14 +20,24 @@ import { Check, Parse } from "typebox/value";
 /** Tab message the worker sends the injected overlay to show the highlights. */
 export const SHOW_CHANGES_OPEN_MESSAGE = "remixlet.showChanges.open";
 
+/**
+ * What a stored record's condition may be: every live assert condition, plus
+ * "design-parity" — removed from the assert schema on 2026-09-03 (the look
+ * review replaced it; wiki/design/look-review.md) but present in verification
+ * records 0.1.x wrote, which must keep loading and rendering
+ * (wiki/decisions/launch-backwards-compatibility.md). Nothing may WRITE it
+ * anew: the assert schema no longer accepts it from the model.
+ */
+export type StoredAssertCondition = AssertCondition | "design-parity";
+
 export interface VerifiedAssertion {
   selector: string;
-  condition: AssertCondition;
+  condition: StoredAssertCondition;
   /** Attribute name (attr-equals) or CSS property (style-equals/style-parity). */
   name?: string;
   /** Expected value: a number for count-*, a string otherwise. */
   expected?: string | number;
-  /** Reference element for style-parity/design-parity. */
+  /** Reference element for style-parity (and stored design-parity records). */
   otherSelector?: string;
 }
 
@@ -55,8 +65,9 @@ const MAX_SELECTOR_LENGTH = 500;
 const MAX_NAME_LENGTH = 200;
 const MAX_EXPECTED_LENGTH = 500;
 
-// Record<AssertCondition, true> so adding a condition to probe-schemas.ts
-// fails compilation here until sanitize and describeAssertion learn it.
+// Record<StoredAssertCondition, true> so adding a condition to
+// probe-schemas.ts fails compilation here until sanitize and
+// describeAssertion learn it. "design-parity" stays for stored records only.
 const KNOWN_CONDITIONS = {
   exists: true,
   "not-exists": true,
@@ -69,7 +80,7 @@ const KNOWN_CONDITIONS = {
   "design-parity": true,
   visible: true,
   "not-clipped": true,
-};
+} satisfies Record<StoredAssertCondition, true>;
 
 const VerifiedAssertionInputSchema = Type.Object({
   selector: Type.String(),
@@ -82,7 +93,7 @@ type VerifiedAssertionInput = Static<typeof VerifiedAssertionInputSchema>;
 const StoredAssertionPayloadSchema = Type.Unknown();
 type StoredAssertionPayload = Static<typeof StoredAssertionPayloadSchema>;
 
-function isKnownCondition(value: string): value is AssertCondition {
+function isKnownCondition(value: string): value is StoredAssertCondition {
   return Object.prototype.hasOwnProperty.call(KNOWN_CONDITIONS, value);
 }
 
@@ -157,6 +168,7 @@ export function describeAssertion(assertion: VerifiedAssertion): string {
         ? `${assertion.name} matches the page's own`
         : "matches the page's own style";
     case "design-parity":
+      // A 0.1.x record: the assertion no longer exists, the stored spot does.
       return "styled like the page's own controls";
   }
 }

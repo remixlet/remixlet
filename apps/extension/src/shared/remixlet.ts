@@ -3,16 +3,18 @@
 // agent's write_remixlet tool. Pure module, no extension APIs.
 
 import { RMX_BRIDGE_VERSION, type RemixletBuiltWith } from "./bridge-version.js";
-import { fetchHostPattern, FETCH_CAPABILITY_PREFIX } from "./fetch-capability.js";
-import { NETWORK_OBSERVE_PREFIX, observeHostPattern, PAGE_WORLD_CAPABILITY } from "./observe-capability.js";
+import { fetchHostPattern, FETCH_CAPABILITY_PREFIX, hostPatternStorageError } from "./fetch-capability.js";
+import { NETWORK_OBSERVE_PREFIX, observeHostPattern } from "./observe-capability.js";
 import { matchPatternStorageError } from "./site-key.js";
 import { containsUnsafeText } from "./safe-text.js";
 
+/**
+ * A script file. Every script runs in the box (wiki/design/mediated-execution.md);
+ * there is no execution world to choose, so a manifest naming one is refused.
+ */
 export interface RemixletScript {
   file: string;
   runAt?: "document_start" | "document_end" | "document_idle";
-  /** USER_SCRIPT (default; sandboxed, bridge messaging) or MAIN (unsafeWindow cases). */
-  world?: "USER_SCRIPT" | "MAIN";
 }
 
 export interface RemixletManifest {
@@ -33,7 +35,8 @@ export interface RemixletManifest {
    * rmx bridge — shared/bridge-version.ts). Extension-authored: write_remixlet
    * stamps it on every save, overwriting model-supplied values, and the mirror
    * build refuses to run code whose stamp is outside the bridge's supported
-   * range. Absent on legacy artifacts, which reads as bridge 1 (compatible).
+   * range. Written on every save; a manifest without it predates the box and
+   * is refused by the same check.
    */
   builtWith?: RemixletBuiltWith;
   /** Capability grants (storage, fetch:<host>, menu, …) — enforced from M2 bridge on. */
@@ -65,7 +68,7 @@ export function isSupportedScriptFile(path: string): boolean {
  */
 export const README_FILE = "README.md";
 
-/** id doubles as a directory name and a userScripts id fragment. */
+/** id doubles as a directory name and a box id. */
 const ID_RE = /^[a-z0-9][a-z0-9-]{1,63}$/;
 
 type JsonPrimitive = string | number | boolean | null;
@@ -147,6 +150,18 @@ export function stampManifestBuiltWith(manifestJson: string, extensionVersion?: 
   return JSON.stringify({ ...raw, builtWith }, null, 2) + "\n";
 }
 
+/**
+ * The write gate for a host grant's REACH: a wildcard spanning a public suffix
+ * or a bare suffix host is refused on new writes. Stored artifacts skip it
+ * (their grants were approved as written and must keep parsing), exactly like
+ * the match-pattern storage check above.
+ */
+function rejectSuffixGrant(pattern: string, prefix: string, stored: boolean): void {
+  if (stored) return;
+  const error = hostPatternStorageError(pattern, prefix);
+  if (error !== undefined) throw new Error(`remixlet.json: capability ${error}`);
+}
+
 function parseManifest(json: string, allowMissingCapabilityRationales: boolean): RemixletManifest {
   let raw: JsonValue;
   try {
@@ -164,8 +179,8 @@ function parseManifest(json: string, allowMissingCapabilityRationales: boolean):
   // The name renders under the honest title in the activation dialog, so it is
   // model prose that must not distort it (H2): bounded length, and no control,
   // newline, bidi, or zero-width characters. New writes only — stored/legacy
-  // artifacts must keep parsing so the mirror can rebuild, like the match,
-  // rationale, and MAIN-world checks below.
+  // artifacts must keep parsing so the mirror can rebuild, like the match
+  // and rationale checks below.
   if (!allowMissingCapabilityRationales && (m.name.length > 60 || containsUnsafeText(m.name))) {
     throw new Error('remixlet.json: "name" must be at most 60 characters with no control, newline, or bidirectional characters');
   }
@@ -182,12 +197,13 @@ function parseManifest(json: string, allowMissingCapabilityRationales: boolean):
     throw new Error('remixlet.json: "matches" must be a non-empty string array');
   }
   // Each pattern must be a well-formed MV3 match, and a `*.`-wildcard must not
-  // span a public suffix (`*.com`, `*.co.uk`, `*.github.io`) — that would grant
-  // one remixlet authority over every unrelated site under it. `<all_urls>` and
-  // a bare `*` host stay storable; their broad SCOPE is put to the user at
-  // activation (the parse boundary can't know the conversation's site key).
+  // span a public suffix (`*.com`, `*.co.il`, `*.appspot.com`, `*.amazonaws.com`;
+  // shared/public-suffix.ts) — that would grant one remixlet authority over
+  // every unrelated site under it. `<all_urls>` and a bare `*` host stay
+  // storable; their broad SCOPE is put to the user at activation (the parse
+  // boundary can't know the conversation's site key).
   // New writes only: stored/legacy artifacts must keep parsing so the mirror
-  // can rebuild, exactly like the rationale and MAIN-world checks below.
+  // can rebuild, exactly like the rationale check below.
   if (!allowMissingCapabilityRationales) {
     // SAFETY: the string-array validation directly above established every match pattern is a string.
     for (const pattern of m.matches as string[]) {
@@ -197,10 +213,10 @@ function parseManifest(json: string, allowMissingCapabilityRationales: boolean):
       }
     }
   }
-  // builtWith stays OPTIONAL in both modes (legacy artifacts predate it and
-  // read as bridge 1), but a present stamp must be well-formed — skew handling
-  // trusts it. Unknown extra keys are tolerated on purpose: future contract
-  // fields must not brick older extensions' mirror rebuilds.
+  // builtWith stays OPTIONAL at the parse boundary (the mirror build refuses
+  // an artifact without it), but a present stamp must be well-formed — skew
+  // handling trusts it. Unknown extra keys are tolerated on purpose: future
+  // contract fields must not brick older extensions' mirror rebuilds.
   if (m.builtWith !== undefined) {
     if (!isJsonObject(m.builtWith)) {
       throw new Error('remixlet.json: "builtWith" must be an object');
@@ -228,8 +244,13 @@ function parseManifest(json: string, allowMissingCapabilityRationales: boolean):
           "other extensions skip the write-time syntax check and cannot be injected safely",
       );
     }
-    if (script.world !== undefined && script.world !== "USER_SCRIPT" && script.world !== "MAIN") {
-      throw new Error(`remixlet.json: script "world" must be "USER_SCRIPT" or "MAIN" (got ${JSON.stringify(script.world)})`);
+    // Refused in both modes: every script runs in the box, so a manifest that
+    // names an execution world was written for a runtime this extension does
+    // not have. A stored one fails its mirror read and surfaces as needs-repair.
+    if ("world" in script) {
+      throw new Error(
+        'remixlet.json: scripts have no "world": remixlet code runs in the box, not in the page, so use the dom API instead',
+      );
     }
     if (
       script.runAt !== undefined &&
@@ -239,20 +260,6 @@ function parseManifest(json: string, allowMissingCapabilityRationales: boolean):
     ) {
       throw new Error(`remixlet.json: script "runAt" is invalid (got ${JSON.stringify(script.runAt)})`);
     }
-  }
-  // MAIN-world code is strictly more power than the sandboxed default; it must
-  // ride the capability-approval surface, never flip silently (§3b of the
-  // network-data-visibility handoff). Enforced for newly-authored manifests
-  // like rationales are — stored legacy artifacts must keep parsing so the
-  // mirror can rebuild.
-  if (
-    !allowMissingCapabilityRationales &&
-    (m.scripts ?? []).some((script) => script.world === "MAIN") &&
-    !(m.capabilities ?? []).includes(PAGE_WORLD_CAPABILITY)
-  ) {
-    throw new Error(
-      `remixlet.json: scripts with "world": "MAIN" require the "${PAGE_WORLD_CAPABILITY}" capability (with a rationale), so the user approves page-world access at activation`,
-    );
   }
   if (m.styles !== undefined && !m.styles.every(isJsonString)) {
     throw new Error('remixlet.json: "styles" must be a string array');
@@ -290,15 +297,23 @@ function parseManifest(json: string, allowMissingCapabilityRationales: boolean):
     throw new Error('remixlet.json: "netRules" requires the "netrules" capability');
   }
   for (const capability of m.capabilities ?? []) {
-    if (capability.startsWith(FETCH_CAPABILITY_PREFIX) && fetchHostPattern(capability) === undefined) {
-      throw new Error(
-        `remixlet.json: invalid fetch capability ${JSON.stringify(capability)} (use fetch:host.example or fetch:*.host.example)`,
-      );
+    if (capability.startsWith(FETCH_CAPABILITY_PREFIX)) {
+      const pattern = fetchHostPattern(capability);
+      if (pattern === undefined) {
+        throw new Error(
+          `remixlet.json: invalid fetch capability ${JSON.stringify(capability)} (use fetch:host.example or fetch:*.host.example)`,
+        );
+      }
+      rejectSuffixGrant(pattern, FETCH_CAPABILITY_PREFIX, allowMissingCapabilityRationales);
     }
-    if (capability.startsWith(NETWORK_OBSERVE_PREFIX) && observeHostPattern(capability) === undefined) {
-      throw new Error(
-        `remixlet.json: invalid network:observe capability ${JSON.stringify(capability)} (use network:observe:host.example or network:observe:*.host.example)`,
-      );
+    if (capability.startsWith(NETWORK_OBSERVE_PREFIX)) {
+      const pattern = observeHostPattern(capability);
+      if (pattern === undefined) {
+        throw new Error(
+          `remixlet.json: invalid network:observe capability ${JSON.stringify(capability)} (use network:observe:host.example or network:observe:*.host.example)`,
+        );
+      }
+      rejectSuffixGrant(pattern, NETWORK_OBSERVE_PREFIX, allowMissingCapabilityRationales);
     }
   }
   // SAFETY: every contract field used by activation has been validated above; unknown future keys remain intentionally tolerated.

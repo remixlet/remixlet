@@ -148,16 +148,38 @@ export function AddProviderForm({
     connectCodex();
   });
 
+  // The page-content-to-provider disclosure, stated in-product before the
+  // consenting click — proceeding past this sentence (Connect, or the ChatGPT
+  // sign-in) is the affirmative consent (wiki/ops/chrome-store-submission.md §2.2).
+  const disclosure = (
+    <p className="max-w-prose text-sm text-muted-foreground">
+      {draft.kind === "codex" ? (
+        <>
+          Remixlet sends your messages and relevant page content to OpenAI through your ChatGPT account. This may
+          include text, page structure, or a screenshot. Nothing from your pages is sent elsewhere.
+        </>
+      ) : (
+        <>
+          When you chat, Remixlet sends your message and content from the page you're working on — text, structure,
+          and sometimes a screenshot — to{" "}
+          {draft.kind === "remixlet"
+            ? "the endpoint you entered"
+            : `${PROVIDER_DEFAULTS[draft.kind].label} using your key`}
+          . Nothing from your pages is sent anywhere else.
+        </>
+      )}
+    </p>
+  );
+
   const credentialStep =
     draft.kind === "codex" ? (
       <div
         className={cn(
-          "flex items-center justify-between gap-3 rounded-lg border p-3",
-          codexSignedInWithoutCodex && "border-destructive/50 bg-destructive/5",
+          "flex items-center justify-between gap-3",
+          codexSignedInWithoutCodex && "rounded-lg border border-destructive/50 bg-destructive/5 p-3",
         )}
       >
-        <div>
-          <p className="text-sm font-medium">ChatGPT account</p>
+        {codexStatus.state !== "signed-out" && (
           <p
             id="codex-status"
             className={cn("text-xs", codexSignedInWithoutCodex ? "text-destructive" : "text-muted-foreground")}
@@ -170,9 +192,9 @@ export function AddProviderForm({
                   : `Signed in as ${codexStatus.email} · ${codexStatus.planType}`
               : codexStatus.state === "pending"
                 ? "OpenAI is waiting for you to confirm the account shown."
-                : "Use the Codex models included with your paid ChatGPT plan."}
+                : null}
           </p>
-        </div>
+        )}
         {codexStatus.state === "signed-in" ? (
           <div className="flex shrink-0 items-center gap-2">
             {busy ? (
@@ -386,12 +408,13 @@ export function AddProviderForm({
           }
           hint={
             draft.kind === "codex"
-              ? "Once you're signed in, Remixlet checks the connection and lists the models you can pick in chat."
+              ? "Use the Codex models included with your paid ChatGPT plan."
               : undefined
           }
           done={credentialsReady}
           last={draft.kind === "codex" || !credentialsReady}
         >
+          {draft.kind === "codex" && disclosure}
           {credentialStep}
           {/* The ChatGPT route is fully determined by the sign-in: name, endpoint
               and model list all come from the provider, so there is nothing to tune —
@@ -408,6 +431,7 @@ export function AddProviderForm({
           done={false}
           last
         >
+          {disclosure}
           <Button
             id="connect-provider"
             type="button"

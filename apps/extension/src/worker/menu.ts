@@ -1,12 +1,13 @@
 // Durable worker-side state for rmx.menu. The worker stores only command
 // metadata and pending invocations; callback functions never leave the
-// authenticated USER_SCRIPT world. A page long-polls its own queue, so a
+// remixlet's box. A box long-polls its own queue, so a
 // popup click can wake a fresh MV3 worker and still reach the owning document.
 
 import { ext } from "../platform/ext.js";
-import { matchesPaused, urlMatchesAny, urlPaused } from "../shared/site-key.js";
+import { pageIneligibleReason, runsOn } from "../shared/eligibility.js";
+import { matchesPaused, urlPaused } from "../shared/site-key.js";
 import { hasCapabilityGrant } from "./activation.js";
-import { readMirror } from "./injection.js";
+import { authenticatedRemixlet, readMirror } from "./injection.js";
 import { readPausedSites } from "./site-pause.js";
 
 export interface MenuCommandSummary {
@@ -201,6 +202,18 @@ export async function clearMenuCommandsForPausedSites(pausedSiteKeys: readonly s
 /** Remove registrations whose owning live remixlet/tab/site no longer exists. */
 export async function reconcileMenuCommands(): Promise<void> {
   const [mirror, pausedSites, state] = await Promise.all([readMirror(), readPausedSites(), readState()]);
+  // The facts gathered here (which tabs exist, which grants are live) describe
+  // THIS snapshot's commands, and clearCommands' verdict runs later, behind
+  // the serialized mutation chain, against whatever the state holds by then. A
+  // command registered in between is absent from these maps, and absence reads
+  // as "tab closed" / "grant revoked" — so judging it here deleted brand-new
+  // registrations moments after they stored (the menu harness suite caught
+  // this racing its menu.list polling against page-load registration; nothing
+  // re-announces, so the command stayed lost for the document's life —
+  // wiki/design/menu-reconcile-race.md). Judge only the commands this snapshot
+  // actually gathered facts for; anything newer keeps until the next
+  // reconcile, which will have gathered its own.
+  const snapshotIds = new Set(Object.keys(state.commands));
   const live = new Map(mirror.map((remixlet) => [remixlet.id, remixlet]));
   const tabIds = [...new Set(Object.values(state.commands).map((command) => command.tabId))];
   const tabs = new Map(
@@ -216,6 +229,7 @@ export async function reconcileMenuCommands(): Promise<void> {
     ),
   );
   await clearCommands((command) => {
+    if (!snapshotIds.has(command.registrationId)) return false;
     const owner = live.get(command.remixletId);
     const tab = tabs.get(command.tabId);
     return (
@@ -224,9 +238,7 @@ export async function reconcileMenuCommands(): Promise<void> {
       !granted.get(command.remixletId) ||
       !tab?.url ||
       tab.url !== command.url ||
-      !urlMatchesAny(command.url, owner.matches) ||
-      urlPaused(command.url, pausedSites) ||
-      matchesPaused(owner.matches, pausedSites)
+      !runsOn(owner, command.url, pausedSites)
     );
   });
 }
@@ -235,10 +247,8 @@ async function authenticateContext(
   message: MenuBridgeMessage,
   sender: chrome.runtime.MessageSender,
 ): Promise<MenuContext | { error: string }> {
-  const remixlet = (await readMirror()).find((candidate) => candidate.id === message.remixletId);
-  if (!remixlet || remixlet.bridgeToken !== message.bridgeToken) {
-    return { error: "unauthenticated remixlet bridge caller" };
-  }
+  const remixlet = await authenticatedRemixlet(message.remixletId, message.bridgeToken);
+  if (!remixlet) return { error: "unauthenticated remixlet bridge caller" };
   if (!remixlet.capabilities.includes("menu") || !(await hasCapabilityGrant(message.remixletId, "menu"))) {
     return { error: `remixlet "${message.remixletId}" does not have a granted "menu" capability` };
   }
@@ -248,8 +258,7 @@ async function authenticateContext(
   if (tabId === undefined || !documentId || !url || sender.frameId !== 0) {
     return { error: "rmx.menu is available only in a top-level authenticated tab document" };
   }
-  const pausedSites = await readPausedSites();
-  if (!urlMatchesAny(url, remixlet.matches) || urlPaused(url, pausedSites) || matchesPaused(remixlet.matches, pausedSites)) {
+  if (pageIneligibleReason(remixlet, url, await readPausedSites()) !== undefined) {
     return { error: "rmx.menu caller is not active on this site" };
   }
   return { remixletId: message.remixletId, tabId, documentId, url };

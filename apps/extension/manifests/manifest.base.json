@@ -1,13 +1,12 @@
 {
   "manifest_version": 3,
   "name": "Remixlet",
-  "version": "0.1.0",
-  "description": "Remix any website with a sentence. Your agent writes small, inspectable, reversible site mods — remixlets.",
+  "version": "1.0.0",
+  "description": "Make any site work the way you want. Tell Remixlet what to change, and watch it bend the site to your will.",
   "permissions": [
     "scripting",
     "storage",
     "unlimitedStorage",
-    "declarativeNetRequest",
     "webRequest",
     "webNavigation",
     "tabs",
@@ -15,14 +14,13 @@
   ],
   "host_permissions": ["<all_urls>"],
   "content_security_policy": {
-    "extension_pages": "default-src 'none'; script-src 'self'; object-src 'self'; style-src 'self' 'unsafe-inline'; font-src 'self'; img-src 'self' data:; connect-src https: http://localhost:* http://127.0.0.1:* data:; base-uri 'none'; form-action 'none'"
+    "extension_pages": "default-src 'none'; script-src 'self'; object-src 'self'; style-src 'self' 'unsafe-inline'; font-src 'self'; img-src 'self' data:; connect-src https: http://localhost:* http://127.0.0.1:* data:; frame-src 'self'; base-uri 'none'; form-action 'none'",
+    "sandbox": "sandbox allow-scripts; default-src 'none'; script-src 'self' blob:; worker-src blob:; base-uri 'none'; form-action 'none'"
+  },
+  "sandbox": {
+    "pages": ["box.html"]
   },
   "web_accessible_resources": [
-    {
-      "resources": ["panel/index.html"],
-      "matches": ["<all_urls>"],
-      "use_dynamic_url": true
-    },
     {
       "resources": ["panel/files/space-grotesk-*.woff2"],
       "matches": ["<all_urls>"]

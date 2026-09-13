@@ -10,7 +10,7 @@
 
 import { useEffect, useState } from "react";
 
-import { discoverProviderModels } from "../../panel/provider-models.js";
+import { discoverProviderModels, type DiscoveredModel } from "../../panel/provider-models.js";
 import { sendToWorker } from "../../panel/worker-client.js";
 import { ext } from "../../platform/ext.js";
 import { type CodexAuthStatus } from "../../shared/codex-oauth.js";
@@ -34,6 +34,16 @@ function fallbackModelIds(text: string): string[] {
         .filter(Boolean),
     ),
   ].sort((left, right) => left.localeCompare(right));
+}
+
+/** Split a discovery result into the stored model list + per-model thinking dials. */
+function catalogFields(discovered: DiscoveredModel[]): Pick<ProviderConfig, "models" | "modelThinking"> {
+  const modelThinking = Object.fromEntries(
+    discovered.flatMap((model) => (model.thinking ? [[model.id, model.thinking] as const] : [])),
+  );
+  const fields: Pick<ProviderConfig, "models" | "modelThinking"> = { models: discovered.map((model) => model.id) };
+  if (Object.keys(modelThinking).length > 0) fields.modelThinking = modelThinking;
+  return fields;
 }
 
 async function loadSettings(): Promise<ProviderSettings> {
@@ -121,14 +131,16 @@ export function useProviderCatalog(): ProviderCatalog {
     setStatus("");
     setError("");
     try {
-      let models: string[];
+      let discovered: Pick<ProviderConfig, "models" | "modelThinking">;
       try {
-        models = await discoverProviderModels(
-          await discoveryOptions({
-            kind: draft.kind,
-            baseUrl: draft.baseUrl,
-            apiKey: draft.apiKey,
-          }),
+        discovered = catalogFields(
+          await discoverProviderModels(
+            await discoveryOptions({
+              kind: draft.kind,
+              baseUrl: draft.baseUrl,
+              apiKey: draft.apiKey,
+            }),
+          ),
         );
       } catch (discoveryError) {
         // A provider that cannot list its models is still usable when the
@@ -136,8 +148,8 @@ export function useProviderCatalog(): ProviderCatalog {
         // Codex is the exception: its model list only ever comes from the
         // signed-in ChatGPT plan, so a failure there is a failure.
         if (draft.kind === "codex") throw discoveryError;
-        models = fallbackModelIds(draft.fallbackModels);
-        if (models.length === 0) throw discoveryError;
+        discovered = { models: fallbackModelIds(draft.fallbackModels) };
+        if (discovered.models.length === 0) throw discoveryError;
       }
       const provider: ProviderConfig = {
         id,
@@ -145,7 +157,7 @@ export function useProviderCatalog(): ProviderCatalog {
         name: draft.name.trim() || PROVIDER_DEFAULTS[draft.kind].label,
         baseUrl: draft.baseUrl.trim(),
         apiKey: draft.kind === "codex" ? "" : draft.apiKey.trim(),
-        models,
+        ...discovered,
         lastUsedAt: new Date().toISOString(),
       };
       await persist(
@@ -154,10 +166,10 @@ export function useProviderCatalog(): ProviderCatalog {
           providers: [...settings.providers, provider],
           selectedModel: settings.selectedModel ?? {
             providerId: id,
-            modelId: models[0]!,
+            modelId: provider.models[0]!,
           },
         },
-        `${provider.name} connected with ${models.length} available model${models.length === 1 ? "" : "s"}.`,
+        `${provider.name} connected with ${provider.models.length} available model${provider.models.length === 1 ? "" : "s"}.`,
       );
       return true;
     } catch (failure: unknown) {
@@ -173,13 +185,14 @@ export function useProviderCatalog(): ProviderCatalog {
     setStatus("");
     setError("");
     void (async () => {
-      const models = await discoverProviderModels(await discoveryOptions(provider));
-      const { lastError: _cleared, ...healthy } = provider;
+      const discovered = catalogFields(await discoverProviderModels(await discoveryOptions(provider)));
+      const { lastError: _cleared, modelThinking: _staleThinking, ...healthy } = provider;
       const refreshed = {
         ...healthy,
-        models,
+        ...discovered,
         lastUsedAt: new Date().toISOString(),
       };
+      const models = discovered.models;
       const selectedModel =
         settings.selectedModel?.providerId === provider.id && !models.includes(settings.selectedModel.modelId)
           ? { providerId: provider.id, modelId: models[0]! }

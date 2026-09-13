@@ -1,5 +1,10 @@
 // Build driver: one source tree → per-browser bundles in dist/<target>/.
-// Usage: node build.mjs --target=chrome|firefox [--watch]
+// Usage: node build.mjs --target=chrome|firefox [--watch | --release]
+//
+// --release is what tools/package.mjs builds: development-only modules are
+// swapped for stubs (the Codex issuer test hook) and the build id is pinned to
+// the version, so one source tree always builds to the same bytes and a
+// packaged zip can be checked against a recorded hash.
 import * as esbuild from "esbuild";
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
@@ -11,6 +16,11 @@ import path from "node:path";
 const args = process.argv.slice(2);
 const target = (args.find((a) => a.startsWith("--target=")) ?? "--target=chrome").split("=")[1];
 const watch = args.includes("--watch");
+const release = args.includes("--release");
+if (watch && release) {
+  console.error("--watch and --release are exclusive");
+  process.exit(1);
+}
 
 const TARGETS = ["chrome", "firefox", "safari"];
 if (!TARGETS.includes(target)) {
@@ -42,13 +52,16 @@ const devReloadBump = {
 // answers page.probe with a named "build mismatch" error when the panel's
 // stamp differs (the dev rebuild-without-reload state). The id is mirrored to
 // dist/<target>/build-id.txt so the test harness can send the real value.
+// Release builds pin the id to the version: every bundle in a package comes
+// from one build, an update always bumps the version, and a pinned id is what
+// makes two builds of one source tree byte-identical.
 let stampSeq = 0;
 let stampedBuildId = "";
 const buildIdStamp = {
   name: "build-id-stamp",
   setup(build) {
     build.onStart(() => {
-      stampedBuildId = `${target}-${Date.now().toString(36)}-${(stampSeq += 1)}`;
+      stampedBuildId = release ? `${target}-v${releaseVersion}` : `${target}-${Date.now().toString(36)}-${(stampSeq += 1)}`;
     });
     build.onLoad({ filter: /[\\/]shared[\\/]build-id\.ts$/ }, () => ({
       contents: `export const BUILD_ID = ${JSON.stringify(stampedBuildId)};`,
@@ -77,6 +90,24 @@ const devReloadStrip = {
   },
 };
 
+// Release builds carry no test hooks: modules listed here resolve to a stub
+// that exports the same names with inert bodies, so the packaged bundles never
+// contain the code — or the storage key names — a hook would honour.
+const releaseStubs = {
+  "/codex-issuer-override.js": "export async function testIssuerOverride() { return undefined; }",
+  "/deletion-fault.js": "export async function testDeletionFault() { return undefined; }",
+};
+const releaseStrip = {
+  name: "release-strip",
+  setup(build) {
+    for (const [suffix, contents] of Object.entries(releaseStubs)) {
+      const filter = new RegExp(`${suffix.replace(/[.]/g, "\\.")}$`);
+      build.onResolve({ filter }, () => ({ path: suffix, namespace: "release-stub" }));
+      build.onLoad({ filter, namespace: "release-stub" }, () => ({ contents, loader: "js" }));
+    }
+  },
+};
+
 function startDevReloadServer() {
   createServer((req, res) => {
     // CORS * so the extension worker can fetch without host permissions.
@@ -101,6 +132,20 @@ function startDevReloadServer() {
       })
       .catch(() => {});
   });
+
+  // Brand generation changes files outside esbuild's module graph. Copy the
+  // whole icon batch before notifying the loaded extension to reload.
+  let iconsTimer;
+  let iconsCopy = Promise.resolve();
+  fsWatch("assets/icons", () => {
+    clearTimeout(iconsTimer);
+    iconsTimer = setTimeout(() => {
+      iconsCopy = iconsCopy
+        .then(copyIcons)
+        .then(() => { buildId += 1; })
+        .catch((error) => console.error(`Icon refresh failed: ${error.message}`));
+    }, 100);
+  });
 }
 
 // Overlay wins; arrays are unioned, objects merged deep, scalars replaced.
@@ -119,29 +164,39 @@ function mergeManifest(base, overlay) {
   return out;
 }
 
-async function buildManifest() {
+async function readManifest() {
   const base = JSON.parse(await readFile("manifests/manifest.base.json", "utf8"));
   const overlay = JSON.parse(await readFile(`manifests/manifest.${target}.json`, "utf8"));
-  const manifest = mergeManifest(base, overlay);
-  await writeFile(path.join(outdir, "manifest.json"), JSON.stringify(manifest, null, 2));
+  return mergeManifest(base, overlay);
+}
+
+async function buildManifest() {
+  await writeFile(path.join(outdir, "manifest.json"), JSON.stringify(await readManifest(), null, 2));
+}
+
+async function copyIcons() {
+  // Toolbar PNGs and both themed UI SVGs are generated from assets/brand.
+  await cp("assets/icons", path.join(outdir, "icons"), { recursive: true });
 }
 
 async function copyStatic() {
   await mkdir(path.join(outdir, "panel"), { recursive: true });
-  // Toolbar/store icons, rasterized from the marketing site's logo.svg so
-  // both surfaces share one mark.
-  await cp("assets/icons", path.join(outdir, "icons"), { recursive: true });
+  await copyIcons();
   await cp("src/panel/index.html", path.join(outdir, "panel/index.html"));
   // Top-level so the OAuth DNR regexSubstitution target is /oauth-callback.html.
   await cp("src/ui/oauth-callback.html", path.join(outdir, "oauth-callback.html"));
   // M3 trust surface pages: popup (action), the standalone first-run page
-  // (welcome, which hosts the userScripts probe iframe), and the control
-  // center (manager, hash-routed). All root-level, linking panel/styles.css.
-  for (const page of ["popup", "manager", "welcome", "probe"]) {
+  // (welcome), and the control center (manager, hash-routed). All root-level,
+  // linking panel/styles.css.
+  for (const page of ["popup", "manager", "welcome"]) {
     await cp(`src/ui/${page}.html`, path.join(outdir, `${page}.html`));
   }
+  // The sandboxed box page every remixlet runs in (manifest sandbox.pages;
+  // wiki/design/mediated-execution.md) and, on Chrome, the offscreen document
+  // that hosts the box iframes and the clipboard backend.
+  await cp("src/box/box.html", path.join(outdir, "box.html"));
   if (target === "chrome") {
-    await cp("src/platform/clipboard-offscreen.html", path.join(outdir, "clipboard-offscreen.html"));
+    await cp("src/platform/offscreen.html", path.join(outdir, "offscreen.html"));
   }
   // The design system faces (Space Grotesk + IBM Plex Mono, shared with the
   // website via packages/design) ship with the extension: fontsource's own
@@ -199,7 +254,7 @@ const shikiSlim = {
 };
 
 const bundles = {
-  plugins: [shikiSlim, buildIdStamp, ...(watch ? [devReloadBump] : [devReloadStrip])],
+  plugins: [shikiSlim, buildIdStamp, ...(watch ? [devReloadBump] : [devReloadStrip]), ...(release ? [releaseStrip] : [])],
   entryPoints: {
     worker: "src/worker/index.ts",
     "panel/main": "src/panel/main.tsx",
@@ -207,11 +262,20 @@ const bundles = {
     popup: "src/ui/popup.tsx",
     manager: "src/ui/manager.tsx",
     welcome: "src/ui/welcome.tsx",
-    probe: "src/ui/onboarding-probe.ts",
-    "drawer-host": "src/platform/drawer-host-content.ts",
     "annotate-host": "src/platform/annotate-host-content.ts",
     "show-changes-host": "src/platform/show-changes-host-content.ts",
-    ...(target === "chrome" ? { "clipboard-offscreen": "src/platform/clipboard-offscreen.ts" } : {}),
+    box: "src/box/box-entry.ts",
+    "page-agent": "src/platform/page-agent-content.ts",
+    // The two MAIN-world files worker/injection.ts registers as content
+    // scripts: the network:observe relay and the development-time observer.
+    relay: "src/bridge/relay-entry.ts",
+    "dev-observe": "src/bridge/dev-observe-entry.ts",
+    // The two files the probe engine injects on demand through
+    // scripting.executeScript (worker/page-probes/engine.ts): the probe
+    // runner for the ISOLATED world and the read_page_state reader for MAIN.
+    probes: "src/worker/page-probes/probes-entry.ts",
+    "page-state": "src/worker/page-probes/page-state-entry.ts",
+    ...(target === "chrome" ? { offscreen: "src/platform/offscreen.ts" } : {}),
   },
   outdir,
   bundle: true,
@@ -225,6 +289,8 @@ const bundles = {
   },
   logLevel: "info",
 };
+
+const releaseVersion = release ? (await readManifest()).version : undefined;
 
 await rm(outdir, { recursive: true, force: true });
 await mkdir(outdir, { recursive: true });
@@ -241,5 +307,5 @@ if (watch) {
   console.log(`watching (${target}) → ${outdir}`);
 } else {
   await Promise.all([esbuild.build(bundles), tailwindBuild()]);
-  console.log(`built (${target}) → ${outdir}`);
+  console.log(`built (${target}${release ? ", release" : ""}) → ${outdir}`);
 }

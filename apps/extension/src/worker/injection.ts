@@ -1,68 +1,66 @@
-// userScripts registration: the sanctioned lane for remixlet JS (wiki/handoff.md §5).
-// Scripts are registered from code strings held in the storage mirror — the
-// worker re-registers from the mirror on every boot and reconciles drift
-// (measured at M0: registrations do NOT persist for unpacked installs; the
-// mirror is the truth).
+// Script registration for the mirror (wiki/design/mediated-execution.md,
+// Lifecycle 1). Remixlet code registers nowhere: it runs inside the box. What
+// registers here are extension-authored files, as dynamic content scripts
+// (scripting.registerContentScripts, platform/content-script-registry.ts):
+// the page agent (ISOLATED world) on every origin a boxed remixlet might run
+// on, the network:observe relay (MAIN world, bridge/relay.ts) on every origin
+// a remixlet with an observe grant might run on, and the development-time
+// observer (MAIN world, bridge/dev-observe.ts) on the origins pinned by live
+// dev-observe grants. No registration carries code, and none is per remixlet:
+// the per-remixlet configuration (matches, observe patterns) reaches the page
+// agent as data over the host port (worker/box.ts). Registrations are rebuilt
+// from the storage mirror on every worker boot and reconciled to it after
+// every mirror write (measured at M0: registrations do NOT persist for
+// unpacked installs; the mirror is the truth). The extension holds no
+// user-scripts permission: the probes go through scripting.executeScript
+// (worker/page-probes/engine.ts), and no lane runs a model-written code
+// string in the tab.
 
-import { mainWorldCode } from "../bridge/relay.js";
-import { bridgeCode, gatedUserScriptCode } from "../bridge/rmx.js";
-import { devObserveRegistrations } from "./dev-observe.js";
+import { devObserveOrigins } from "./dev-observe.js";
 import { ext } from "../platform/ext.js";
-import {
-  scriptInjector,
-  type UserScriptRegistration,
-  type UserScriptWorld,
-} from "../platform/script-injector.js";
-import {
-  matchesPaused,
-  originWidePatterns,
-  siteKeyExcludePatterns,
-  siteKeyForMatches,
-} from "../shared/site-key.js";
+import { contentScriptRegistry, type ContentScriptRegistration } from "../platform/content-script-registry.js";
+import { matchesPaused, originWidePatterns, siteKeyExcludePatterns } from "../shared/site-key.js";
+import { broadcastBoxRefresh } from "./box.js";
 import { readPausedSites } from "./site-pause.js";
 
-/** Mirror entry: the injectable slice of an enabled remixlet. */
+/**
+ * Mirror entry: the injectable slice of an ELIGIBLE remixlet. Membership is
+ * the artifact-level verdict (worker/eligibility.ts judgeArtifact, applied by
+ * the mirror build in activation.ts): enabled, not being deleted, readable
+ * from its committed snapshot, valid rules, bridge-compatible. A remixlet
+ * absent from the mirror runs nowhere and holds no bridge token.
+ */
 export interface ActiveRemixlet {
   id: string;
-  /**
-   * Why this remixlet's builtWith stamp falls outside the bridge's supported
-   * range (shared/bridge-version.ts), set by the mirror build. A skewed
-   * remixlet KEEPS its mirror entry, but none of its code runs: no script
-   * registration, no CSS.
-   */
-  skew?: string;
-  /** Secret known only to this remixlet's isolated world and the worker. */
+  /** Secret known only to the box host and the worker. */
   bridgeToken: string;
-  /**
-   * Token naming the MAIN↔USER_SCRIPT relay's DOM events. Deliberately a
-   * SEPARATE secret: it is embedded in MAIN-world code (page-shared world)
-   * and must never be the capability-bearing bridgeToken.
-   */
-  relayToken: string;
   matches: string[];
-  js: { code: string; world?: "USER_SCRIPT" | "MAIN"; runAt?: "document_start" | "document_end" | "document_idle" }[];
+  js: {
+    code: string;
+    /** The stored file name (manifest `scripts[].file`). */
+    file: string;
+    runAt?: "document_start" | "document_end" | "document_idle";
+  }[];
   css: string[];
   /** Manifest capability grants — the worker bridge enforces against these. */
   capabilities: string[];
-  /** GRANTED network:observe host patterns — drives the MAIN-world interceptor. */
+  /** GRANTED network:observe host patterns — the page agent filters the relay's records against them per box. */
   networkObserve: string[];
-}
-
-interface MainWorldFile {
-  code: string;
-  runAt?: "document_start" | "document_end" | "document_idle";
 }
 
 const MIRROR_KEY = "activeRemixlets";
 const BRIDGE_TOKENS_KEY = "remixletBridgeTokens";
-const RELAY_TOKENS_KEY = "remixletRelayTokens";
-const SCRIPT_PREFIX = "rmx-";
-/** "@" cannot occur in a remixlet id, so this suffix can never collide. */
-const MAIN_SCRIPT_SUFFIX = "@main";
-const WORLD_PREFIX = "rmx-";
+/** The page agent's single dynamic content-script registration. */
+export const PAGE_AGENT_SCRIPT_ID = "rmx-page-agent";
+/** The shipped agent file, registered here. */
+export const PAGE_AGENT_FILE = "page-agent.js";
+/** The network:observe relay's single registration (MAIN world). */
+export const RELAY_SCRIPT_ID = "rmx-relay";
+const RELAY_FILE = "relay.js";
+/** The development-time observer's single registration (MAIN world). */
+export const DEV_OBSERVE_SCRIPT_ID = "rmx-dev-observe";
+const DEV_OBSERVE_FILE = "dev-observe.js";
 
-// @types/chrome currently trails Chrome 133's worldId fields. Keep the
-// compatibility shape local until the package catches up.
 export async function readMirror(): Promise<ActiveRemixlet[]> {
   const stored = await ext.storage.local.get(MIRROR_KEY);
   // SAFETY: the store is written only by writeMirror with ActiveRemixlet entries.
@@ -74,49 +72,78 @@ export async function writeMirror(remixlets: ActiveRemixlet[]): Promise<void> {
 }
 
 export async function bridgeTokenFor(remixletId: string): Promise<string> {
-  return tokenFor(BRIDGE_TOKENS_KEY, remixletId);
-}
-
-export async function relayTokenFor(remixletId: string): Promise<string> {
-  return tokenFor(RELAY_TOKENS_KEY, remixletId);
-}
-
-async function tokenFor(storageKey: string, remixletId: string): Promise<string> {
-  const stored = await ext.storage.local.get(storageKey);
-  // SAFETY: each token store is written below as a string-keyed token map.
-  const tokens = (stored[storageKey] as Record<string, string> | undefined) ?? {};
+  const stored = await ext.storage.local.get(BRIDGE_TOKENS_KEY);
+  // SAFETY: the token store is written below as a string-keyed token map.
+  const tokens = (stored[BRIDGE_TOKENS_KEY] as Record<string, string> | undefined) ?? {};
   if (tokens[remixletId]) return tokens[remixletId];
   const token = crypto.randomUUID();
-  await ext.storage.local.set({ [storageKey]: { ...tokens, [remixletId]: token } });
+  await ext.storage.local.set({ [BRIDGE_TOKENS_KEY]: { ...tokens, [remixletId]: token } });
   return token;
 }
 
 /**
- * Make registered user scripts match the mirror exactly. Idempotent; run on
- * every worker boot and after every mirror write. USER_SCRIPT world with
- * messaging enabled is the capability-bridge transport.
- *
- * Each injectable remixlet gets up to TWO registrations: one USER_SCRIPT
- * entry (bridge + gated sandboxed files, per-remixlet worldId) and one MAIN
- * entry (relay + SPA navigation watcher + network:observe interceptor when
- * granted + the remixlet's gated MAIN files). MAIN-world code never receives
- * the rmx.* bridge — only the relay.
+ * Forget a remixlet's bridge token (delete-forever). A later install under
+ * the same id mints a fresh one, so a host still holding the old token can
+ * never authenticate against the new artifact.
  */
-export function reconcileUserScripts(): Promise<void> {
+export async function clearTokens(remixletId: string): Promise<void> {
+  const stored = await ext.storage.local.get(BRIDGE_TOKENS_KEY);
+  // SAFETY: see bridgeTokenFor.
+  const tokens = (stored[BRIDGE_TOKENS_KEY] as Record<string, string> | undefined) ?? {};
+  if (tokens[remixletId] === undefined) return;
+  delete tokens[remixletId];
+  await ext.storage.local.set({ [BRIDGE_TOKENS_KEY]: tokens });
+}
+
+/**
+ * The mirror entry a bridge caller speaks for, or undefined when the caller
+ * is not authenticated: unknown id, or a token that is missing, empty or
+ * different on either side. Both tokens must be present non-empty strings
+ * BEFORE the comparison — `undefined === undefined` must never authenticate
+ * a tokenless entry or a message with no token.
+ */
+export async function authenticatedRemixlet(remixletId: string, bridgeToken: string): Promise<ActiveRemixlet | undefined> {
+  if (!isNonEmptyString(bridgeToken)) return undefined;
+  const remixlet = (await readMirror()).find((candidate) => candidate.id === remixletId);
+  if (!remixlet || !isNonEmptyString(remixlet.bridgeToken)) return undefined;
+  return remixlet.bridgeToken === bridgeToken ? remixlet : undefined;
+}
+
+// The message arrives off the wire and the mirror off storage: neither type
+// annotation is a guarantee, so the tokens are checked as values.
+function isNonEmptyString<Value>(value: Value): value is Value & string {
+  return Object.prototype.toString.call(value) === "[object String]" && String(value).length > 0;
+}
+
+/**
+ * Make the registrations match the mirror exactly. Idempotent; run on every
+ * worker boot and after every mirror write.
+ *
+ * Three registrations at most, all of them shipped files. The page agent's
+ * matches are the union of every boxed remixlet's origin-wide patterns; the
+ * worker decides per page which remixlets actually run (worker/box.ts), so
+ * the registration only has to bring the agent to every page that might
+ * need it. The relay's matches are the same union over the remixlets that
+ * hold a network:observe grant, so wherever the relay runs the agent runs
+ * too and can claim its token. The dev-observe observer's matches are the
+ * origins of the live grants. Every pass ends by telling the offscreen host
+ * to re-resolve its live pages.
+ */
+export function reconcileRegistrations(): Promise<void> {
   // Serialized: the diff below (getScripts → unregister → register/update) is
   // not atomic, and callers arrive from independent message handlers (the
   // activation path's store lock covers only itself; devObserve.enable/disable
   // call in directly). Two interleaved passes can both see a script as absent
   // and double-register it — a thrown "Duplicate script ID" surfaced as a chat
   // error. In-flight-only state, nothing to reconstruct after a worker death.
-  const run = reconcileChain.then(reconcileUserScriptsUnchained, reconcileUserScriptsUnchained);
+  const run = reconcileChain.then(reconcileRegistrationsUnchained, reconcileRegistrationsUnchained);
   reconcileChain = run.catch(() => undefined);
   return run;
 }
 
 let reconcileChain: Promise<unknown> = Promise.resolve();
 
-async function reconcileUserScriptsUnchained(): Promise<void> {
+async function reconcileRegistrationsUnchained(): Promise<void> {
   // Pause rides on excludeMatches: registrations stay (a resume is one
   // reconcile away, and a restart rebuilds them from the store either way),
   // the paused pages just stop matching. Always pass the list — an empty array
@@ -124,117 +151,109 @@ async function reconcileUserScriptsUnchained(): Promise<void> {
   const pausedSites = await readPausedSites();
   const excludeMatches = pausedSites.flatMap(siteKeyExcludePatterns);
 
-  // Skewed remixlets register NOTHING: code written against a different rmx
-  // contract fails in undefined ways mid-run, so it must not start at all —
-  // the script log carries the needs-repair reason instead.
-  const injectable = (await readMirror()).filter(
-    (r) => r.skew === undefined && (r.js.length > 0 || (r.networkObserve ?? []).length > 0),
-  );
-  const backend = scriptInjector();
-  if (!backend.available) {
-    if (injectable.length > 0) throw new Error(backend.disabledReason);
+  // The mirror holds only eligible remixlets (see ActiveRemixlet). A remixlet
+  // with only styles has no box, so it wants neither the agent nor the relay.
+  const boxed = (await readMirror()).filter((r) => r.js.length > 0);
+  const observing = boxed.filter((r) => (r.networkObserve ?? []).length > 0);
+
+  const wanted = new Map<string, ContentScriptRegistration>();
+  const agentMatches = registrationMatches(boxed, pausedSites);
+  if (agentMatches.length > 0) {
+    wanted.set(PAGE_AGENT_SCRIPT_ID, {
+      id: PAGE_AGENT_SCRIPT_ID,
+      matches: agentMatches,
+      excludeMatches,
+      js: [PAGE_AGENT_FILE],
+      // document_start: the agent reports readyState as it changes (page.facts)
+      // and each box waits for its own runAt, so a document_start remixlet sees
+      // the page before its scripts run; and it must run before any page
+      // script to claim the relay's token.
+      runAt: "document_start",
+      world: "ISOLATED",
+      // Top frame only: the runtime mediates one document per tab.
+      allFrames: false,
+      // The boot reconcile rebuilds it from the mirror, like every registration.
+      persistAcrossSessions: false,
+    });
+  }
+  const relayMatches = registrationMatches(observing, pausedSites);
+  if (relayMatches.length > 0) {
+    wanted.set(RELAY_SCRIPT_ID, {
+      id: RELAY_SCRIPT_ID,
+      matches: relayMatches,
+      excludeMatches,
+      js: [RELAY_FILE],
+      // document_start: fetch must be wrapped before the page's first request,
+      // and the token must be on <html> before any page script could read it.
+      runAt: "document_start",
+      world: "MAIN",
+      allFrames: false,
+      persistAcrossSessions: false,
+    });
+  }
+  const devObserved = await devObserveOrigins();
+  if (devObserved.length > 0) {
+    wanted.set(DEV_OBSERVE_SCRIPT_ID, {
+      id: DEV_OBSERVE_SCRIPT_ID,
+      // Pinned to the origins recorded at grant time: a cross-origin
+      // navigation mid-conversation carries no observation with it.
+      matches: devObserved.map((origin) => `${origin}/*`),
+      js: [DEV_OBSERVE_FILE],
+      // The patch must beat the page's first fetch.
+      runAt: "document_start",
+      world: "MAIN",
+      allFrames: false,
+      persistAcrossSessions: false,
+    });
+  }
+
+  try {
+    await applyRegistrations(wanted);
+  } finally {
+    await broadcastBoxRefresh();
+  }
+}
+
+/**
+ * The origin-wide union of the given remixlets' matches, minus the ones a
+ * pause owns. Registration is ORIGIN-WIDE because the browser evaluates
+ * `matches` only at document creation, so path-scoped patterns would miss
+ * every client-side route arrival; the manifest's real matches are applied
+ * at runtime (the box for its files, the agent for the relay's records). A
+ * pause OWNS the remixlet, not just the site it was authored on: once any
+ * host this remixlet claims is paused, it contributes no host at all, so a
+ * remixlet spanning several hosts stops on all of them instead of quietly
+ * living on at its other one. (An <all_urls> remixlet claims no host, so it
+ * is never owned this way; the paused-site excludes still stop it exactly
+ * where the pause was made.)
+ */
+function registrationMatches(remixlets: ActiveRemixlet[], pausedSites: string[]): string[] {
+  const matches: string[] = [];
+  for (const remixlet of remixlets) {
+    if (matchesPaused(remixlet.matches, pausedSites)) continue;
+    for (const pattern of originWidePatterns(remixlet.matches)) {
+      if (!matches.includes(pattern)) matches.push(pattern);
+    }
+  }
+  return matches;
+}
+
+/**
+ * The id-keyed diff: whatever is registered and not wanted is unregistered
+ * (so a registration an older build owned, or one whose grant expired, never
+ * lingers), the rest is registered or updated in place.
+ */
+async function applyRegistrations(wanted: Map<string, ContentScriptRegistration>): Promise<void> {
+  const registry = contentScriptRegistry();
+  if (!registry.available) {
+    if (wanted.size > 0) throw new Error("The browser cannot register the extension's content scripts here.");
     return;
   }
-
-  const wanted = new Map<string, UserScriptRegistration>();
-  for (const remixlet of injectable) {
-    const usFiles = remixlet.js.filter((script) => (script.world ?? "USER_SCRIPT") !== "MAIN");
-    const mainFiles = remixlet.js.filter((script) => script.world === "MAIN");
-    const observePatterns = remixlet.networkObserve ?? [];
-    // SPA-aware injection: register ORIGIN-WIDE (the browser evaluates
-    // `matches` only at document creation, so path-scoped patterns would miss
-    // every client-side route arrival) and enforce the manifest's real
-    // matches at runtime — the gate wrapping the remixlet's files runs them
-    // when the URL first satisfies the matches, at load or on a later
-    // history.pushState navigation.
-    const registrationMatches = originWidePatterns(remixlet.matches);
-    // A pause OWNS the remixlet, not just the site it was authored on: once any
-    // host this remixlet claims is paused, exclude EVERY host it claims, so a
-    // remixlet spanning several hosts stops on all of them instead of quietly
-    // living on at its other one. (An <all_urls> remixlet claims no host, so it
-    // is never owned this way — the paused-site excludes above still stop it
-    // exactly where the pause was made.)
-    const remixletExcludes = matchesPaused(remixlet.matches, pausedSites)
-      ? [...new Set([...excludeMatches, ...siteKeyExcludePatterns(siteKeyForMatches(remixlet.matches))])]
-      : excludeMatches;
-    if (usFiles.length > 0) {
-      const worldId = WORLD_PREFIX + remixlet.id;
-      await backend.configureWorld(worldId);
-      const scriptId = SCRIPT_PREFIX + remixlet.id;
-      wanted.set(scriptId, {
-        id: scriptId,
-        matches: registrationMatches,
-        excludeMatches: remixletExcludes,
-        // The rmx.* bridge rides ahead of the remixlet's own code, which is
-        // wrapped in the URL gate as one generated entry.
-        js: [
-          { code: bridgeCode(remixlet.id, remixlet.bridgeToken, remixlet.relayToken ?? "") },
-          {
-            code: gatedUserScriptCode({
-              remixletId: remixlet.id,
-              bridgeToken: remixlet.bridgeToken,
-              matches: remixlet.matches,
-              files: usFiles.map((script) => ({ code: script.code })),
-            }),
-          },
-        ],
-        // Per-registration runAt: first sandboxed file's choice wins.
-        runAt: usFiles[0]?.runAt ?? "document_idle",
-        world: "USER_SCRIPT" satisfies UserScriptWorld,
-        worldId,
-      });
-    }
-    // Every injectable remixlet gets a MAIN registration: the SPA navigation
-    // watcher lives there (only the page's own world sees history.pushState
-    // calls) and feeds the USER_SCRIPT gate over the relay. Pinned to
-    // document_start so the history patch beats the page's router (and, when
-    // granted, the interceptor is listening before the page's first fetch);
-    // mainWorldCode defers DOM-phase files internally.
-    {
-      const mainFilesForRegistration: MainWorldFile[] = mainFiles.map((script) => {
-        const registrationFile: MainWorldFile = { code: script.code };
-        if (script.runAt) registrationFile.runAt = script.runAt;
-        return registrationFile;
-      });
-      const registrationRunAt = "document_start" as const;
-      const scriptId = SCRIPT_PREFIX + remixlet.id + MAIN_SCRIPT_SUFFIX;
-      wanted.set(scriptId, {
-        id: scriptId,
-        matches: registrationMatches,
-        excludeMatches: remixletExcludes,
-        js: [
-          {
-            code: mainWorldCode({
-              relayToken: remixlet.relayToken ?? "",
-              matches: remixlet.matches,
-              observePatterns,
-              files: mainFilesForRegistration,
-              registrationRunAt,
-            }),
-          },
-        ],
-        runAt: registrationRunAt,
-        world: "MAIN" satisfies UserScriptWorld,
-      });
-    }
-  }
-
-  // The dev-observe observers ride the same reconcile (the id-keyed diff below
-  // unregisters ANYTHING not in `wanted`, so a registration owned elsewhere
-  // would be torn down here): live grants contribute registrations, expired or
-  // removed grants simply stop contributing and the diff drops their scripts.
-  for (const registration of await devObserveRegistrations()) {
-    wanted.set(registration.id, registration);
-  }
-
-  const registered = await backend.getScripts();
-  const have = new Map(registered.map((s) => [s.id, s]));
-  const toUnregister = [...have.keys()].filter((id) => !wanted.has(id));
-  await backend.unregister(toUnregister);
-
-  const toRegister: UserScriptRegistration[] = [];
-  const toUpdate: UserScriptRegistration[] = [];
-  for (const [scriptId, spec] of wanted) (have.has(scriptId) ? toUpdate : toRegister).push(spec);
-  if (toRegister.length > 0) await backend.register(toRegister);
-  if (toUpdate.length > 0) await backend.update(toUpdate);
+  const have = new Set((await registry.getScripts()).map((script) => script.id));
+  await registry.unregister([...have].filter((id) => !wanted.has(id)));
+  const toRegister: ContentScriptRegistration[] = [];
+  const toUpdate: ContentScriptRegistration[] = [];
+  for (const [id, registration] of wanted) (have.has(id) ? toUpdate : toRegister).push(registration);
+  await registry.register(toRegister);
+  await registry.update(toUpdate);
 }

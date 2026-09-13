@@ -1,4 +1,4 @@
-// CSS injection (wiki/handoff.md §5): the userScripts API is JS-only, so remixlet CSS
+// CSS injection (wiki/handoff.md §5): the box runs only JavaScript, so remixlet CSS
 // is inserted as strings on every top-frame navigation, read fresh from the
 // mirror each time. That freshness is the defense against the field-tested
 // stale-CSS pitfall: nothing ever caches CSS content at registration time —
@@ -18,7 +18,7 @@
 // duplicate insert of identical rules.
 
 import { ext } from "../platform/ext.js";
-import { matchesPaused, urlMatchesAny, urlPaused } from "../shared/site-key.js";
+import { runsOn } from "../shared/eligibility.js";
 import { readMirror } from "./injection.js";
 import { readPausedSites } from "./site-pause.js";
 
@@ -61,24 +61,16 @@ async function syncCssForTab(tabId: number, url: string, options: { freshDocumen
     // died with it.
     const injected = options.freshDocument ? [] : await readInjectedCss(stateKey);
     const pausedSites = await readPausedSites();
-    const paused = urlPaused(url, pausedSites);
     const next: InjectedCssEntry[] = [];
     const mirror = await readMirror();
     for (const remixlet of mirror) {
       if (remixlet.css.length === 0) continue;
       const has = injected.find((entry) => entry.id === remixlet.id);
-      // Two pause rules, same pair the registration path applies: this site is
-      // paused, or a pause elsewhere owns this remixlet outright (a remixlet
-      // spanning several hosts pauses on all of them, not just the host the
-      // pause was authored from).
-      // A skewed remixlet (builtWith outside the supported bridge range) never
-      // wants its CSS either — none of its code runs, and half of a broken
-      // feature styling the page would be worse than nothing.
-      const wants =
-        remixlet.skew === undefined &&
-        !paused &&
-        !matchesPaused(remixlet.matches, pausedSites) &&
-        urlMatchesAny(url, remixlet.matches);
+      // The one page-level run decision (shared/eligibility.ts): the URL is
+      // within the matches, this site is not paused, and no pause elsewhere
+      // owns the remixlet outright (a remixlet spanning several hosts pauses
+      // on all of them, not just the host the pause was authored from).
+      const wants = runsOn(remixlet, url, pausedSites);
       if (wants && !has) {
         const css = remixlet.css.join("\n");
         await ext.scripting.insertCSS({ target: { tabId }, origin: "AUTHOR", css });

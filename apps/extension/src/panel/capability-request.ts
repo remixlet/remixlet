@@ -43,8 +43,9 @@
 import { CAPABILITY_GRANT_MARKER, DEV_OBSERVE_GRANT_MARKER } from "../agent/contracts.js";
 import { capabilityExplanation } from "../shared/capability-copy.js";
 import { FETCH_CAPABILITY_PREFIX, fetchHostPattern } from "../shared/fetch-capability.js";
-import { NETWORK_OBSERVE_PREFIX, observeHostPattern, PAGE_WORLD_CAPABILITY } from "../shared/observe-capability.js";
-import { matchesCoverAllSites } from "../shared/site-key.js";
+import { NETWORK_OBSERVE_PREFIX, observeHostPattern } from "../shared/observe-capability.js";
+import type { CapabilityApprovalProposal } from "../worker/activation.js";
+import { matchesCoverAllSites, matchesSpanningPublicSuffix } from "../shared/site-key.js";
 
 export { CAPABILITY_GRANT_MARKER, DEV_OBSERVE_GRANT_MARKER };
 export { capabilityExplanation };
@@ -57,7 +58,6 @@ const BARE_CAPABILITIES = new Set([
   "notifications",
   "netrules",
   "schedule",
-  PAGE_WORLD_CAPABILITY,
 ]);
 
 /** A single ask can name a handful of capabilities; a hundred is a bug or an attack. */
@@ -115,7 +115,9 @@ export function capabilityGrantPrompt(capabilities: string[]): string {
     "Panel note: the user clicked Allow for the capabilities named above, for the request already in this " +
     "conversation. This note itself grants nothing — the extension enforces the granted set at write and " +
     "activation, rejecting names outside it. These capabilities are available to build with now: build, activate, " +
-    "and verify the remixlet."
+    "and verify the remixlet. Your pre-grant findings carry over — the feasibility verdict, inventory, and design " +
+    "inspection all still count (only capture_page must be fresh), so go straight from the capture to the write " +
+    "instead of re-probing elements or styles you already inspected: every re-probe costs the user real seconds."
   );
 }
 
@@ -172,21 +174,51 @@ export function scopeExplanation(matches: readonly string[], siteKey: string): S
   if (matchesCoverAllSites(matches)) {
     return {
       title: "Runs on every site you visit",
-      detail: "This remixlet's code runs on every website you open — your bank and email included — where it can read and change the page.",
+      detail: "It can read and change every page you open.",
+    };
+  }
+  // A wildcard over a shared domain (`*.appspot.com`, `*.co.il`): the write
+  // gate refuses these today, so this is the stored-artifact case (item 8),
+  // and the card must say what such a pattern reaches rather than list the
+  // suffix as if it were one site.
+  const spanned = matchesSpanningPublicSuffix(matches);
+  if (spanned.length > 0) {
+    const list = spanned.length === 1 ? spanned[0]! : `${spanned.slice(0, -1).join(", ")} and ${spanned.at(-1)}`;
+    return {
+      title: `Runs on every site under ${list}`,
+      detail: `People host their own sites on ${spanned.length === 1 ? "this domain" : "these domains"}, you must be aware your remixlet will apply to all of them.`,
     };
   }
   const hosts = siteKey.split("+").filter((part) => part.length > 0 && part !== "*");
   if (hosts.length === 0) {
     return {
       title: "Runs on the sites it names",
-      detail: "This remixlet's code can read and change pages on the websites named in its settings, and has no access to any other site.",
+      detail: "It can read and change pages on those sites and nothing else.",
     };
   }
   const list = hosts.length === 1 ? hosts[0]! : `${hosts.slice(0, -1).join(", ")} and ${hosts.at(-1)}`;
   return {
     title: `Runs on ${list}`,
-    detail: "This remixlet's code can read and change pages there — subdomains included — and has no access to any other site.",
+    detail: "It can read and change pages there, subdomains included, and nothing else.",
   };
+}
+
+/**
+ * The activation dialog's title: the one question this proposal asks. The
+ * dialog never opens for the everyday grant (the chat card covers that and
+ * activation auto-approves it), only for what the card never covered — an
+ * all-sites or shared-domain scope, a version that widens its site list, a
+ * changed network-rules file, or code that would run outside the site this
+ * chat is bound to. Each is a different question, so the title asks it; only
+ * when several apply at once does the generic title stand in.
+ */
+export function approvalDialogTitle(proposal: CapabilityApprovalProposal): string {
+  const questions: string[] = [];
+  if (proposal.coversAllSites) questions.push("Run on every site?");
+  else if (proposal.broadScope) questions.push("Run on more sites?");
+  if (proposal.netRulesChanged) questions.push("Apply its changed network rules?");
+  if (proposal.offSite) questions.push("Run on other sites too?");
+  return questions.length === 1 ? questions[0]! : "Allow more access?";
 }
 
 /**
@@ -199,9 +231,9 @@ export function capabilityGrantActionLabel(capabilities: string[]): string {
 
 /**
  * The replacement half of an activation that swaps one capability for another:
- * what the new version stops using. A dropped capability is durably revoked
- * (the worker rewrites the remixlet's grant record to exactly the new
- * manifest's set), and telling the user is what makes the ask read as a
+ * what the new version stops using. A dropped capability is durably gone (the
+ * stored manifest is the approval record, and the new version's manifest no
+ * longer names it), and telling the user is what makes the ask read as a
  * replacement rather than ever-growing access — the SoundCloud run's "one
  * more access" wording left the user believing both grants stayed live.
  */
@@ -256,10 +288,8 @@ function isString<T>(value: T): value is T & string {
  * what it means for the person deciding, in everyday words.
  */
 export const DEV_OBSERVE_EXPLANATION = {
-  title: "Let Remixlet watch what this page loads",
-  detail:
-    "Only data the site already fetches to show you the page, and only for this chat. The page will reload once " +
-    "so Remixlet can see it.",
+  title: "See what this page loads, for this chat",
+  detail: "It reads the data the site already fetches, and the page reloads once.",
 } as const;
 
 /** The action row the chat shows for the click, live and on resume. */
@@ -280,7 +310,10 @@ export function devObserveGrantPrompt(origin: string): string {
     "grants nothing — the extension enforces the grant on the probe. Now: capture the page fresh, read the observed " +
     "responses with observe_network_bodies (use urlFilter and search with a value you can see rendered — do not dump " +
     "bodies), identify the ONE host whose response really carries the needed field, and record a " +
-    "feasible-with-capability verdict naming exactly that host. Do not build before that verdict exists."
+    "feasible-with-capability verdict naming exactly that host. Do not build before that verdict exists. The reload " +
+    "changed what the network buffer holds, not what the page is: your earlier DOM, selector, and design findings " +
+    "still stand unless the fresh capture contradicts them, so do not re-run element or design probes you already " +
+    "have answers from — every re-probe costs the user real seconds."
   );
 }
 

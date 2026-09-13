@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 512 512" aria-label="Remixlet dark icon">
+  <defs>
+    <clipPath id="remixlet-dark-circle">
+      <circle cx="256" cy="256" r="240" />
+    </clipPath>
+  </defs>
+  <g clip-path="url(#remixlet-dark-circle)">
+    <rect width="512" height="512" fill="#FFFFFF" />
+    <path d="M0 120H323C385 120 431 174 431 241C431 291 399 335 346 354L324 329C368 322 399 284 399 241C399 190 365 149 323 149H0Z M0 185H313C342 185 365 210 365 241C365 271 342 296 313 296H252L469.857142857143 540H424.642857142857L180 266H313A25 25 0 0 0 313 216H0Z M103 266H143L387.642857142857 540H347.642857142857Z" fill="#000000" />
+  </g>
+</svg>

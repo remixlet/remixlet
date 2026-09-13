@@ -1,17 +1,20 @@
 // The structured probe templates (wiki/raw/handoffs/structured-page-probes.md).
-// Each is a SELF-CONTAINED function: no imports, no closures over module
-// scope, no syntax esbuild rewrites into helper calls — because the engine
-// serializes them with fn.toString() and executes the source in the page's
-// USER_SCRIPT world. Model input reaches them only as the single JSON-encoded
-// `params` argument; nothing here may build code from a parameter.
+// They ship as ordinary bundled code: probes.js carries them into the tab's
+// ISOLATED world (probes-entry.ts, runner.ts) and page-state.js carries
+// read_page_state into the MAIN world (page-state-entry.ts), both injected by
+// the worker engine through scripting.executeScript. Model input reaches a
+// template only as the `params` VALUE, passed through executeScript's `args`;
+// nothing here may build code from a parameter, and the extension CSP these
+// worlds run under refuses eval, Function and string timers anyway.
 //
-// The USER_SCRIPT world is an isolated world, so MAIN-world getters/proxies a
-// page defines are not visible here: these structured DOM reads are
+// The ISOLATED world is the content-script world, so MAIN-world getters/proxies
+// a page defines are not visible here: these structured DOM reads are
 // side-effect-free by construction. Keep it that way — e.g. never call
-// canvas.getContext() (it can CREATE a context) to sniff canvas type. The one
-// sanctioned exception is click_element, whose entire purpose is the side
-// effect (dispatching a click so interactive behavior is verifiable); every
-// other template stays read-only.
+// canvas.getContext() (it can CREATE a context) to sniff canvas type. The
+// sanctioned exceptions are click_element, whose entire purpose is the side
+// effect (dispatching a click so interactive behavior is verifiable), and
+// locate_for_review, which scrolls an off-screen element into view so it can
+// be photographed; every other template stays read-only.
 
 import type {
   AssertPageStateParamsType,
@@ -19,6 +22,7 @@ import type {
   InspectDesignParamsType,
   InspectElementParamsType,
   ListNetworkResourcesParamsType,
+  LocateForReviewParamsType,
   ObserveNetworkBodiesParamsType,
   ProbeName,
   QueryElementsParamsType,
@@ -27,6 +31,12 @@ import type {
   ReplayNetworkResourceParamsType,
   SearchElementsParamsType,
 } from "../../shared/probe-schemas.js";
+import { currentPageLoadToken } from "../../shared/network-ids.js";
+import { isSensitiveField, markupWithoutSecrets } from "../../shared/sensitive-fields.js";
+// The box's click rule, shared verbatim with remixlet code's dom.click():
+// policy.ts is pure (no chrome.*, no DOM global at import time), so the
+// ISOLATED-world probe bundle can carry it.
+import { clickDecision, pageResourceUrls, type UrlContext } from "../../box/policy.js";
 
 type ProbePrimitive = string | number | boolean | null | undefined;
 type ProbeValue = ProbePrimitive | ProbeObject | ProbeValue[];
@@ -46,7 +56,8 @@ interface SerializedProbeValue {
   truncated: boolean;
 }
 
-interface ProbeResult extends ProbeObject {}
+/** What every template answers with: a JSON-shaped record the runner serialises. */
+export interface ProbeResult extends ProbeObject {}
 
 interface AssertionOutcome {
   pass: boolean;
@@ -83,10 +94,15 @@ interface InlineStateEntry extends ProbeObject {
  * §Layer 2). There is no API to read the configured limit, so saturation is
  * reported as a >=-default heuristic — enough for the agent to know the list
  * may be incomplete and escalate instead of concluding "no such request".
- * The 250 literal is inlined at each site that reports saturation: probe
- * functions are serialized standalone via fn.toString() and injected into
- * the page, so they cannot close over module scope (see the file header).
  */
+const RESOURCE_TIMING_DEFAULT_BUFFER = 250;
+
+/**
+ * Globals read_page_state never resolves and searchJson never walks: storage
+ * and credential roots hold session tokens, not page UI state, and the
+ * structured lane needs no approval (C3).
+ */
+const DENIED_STATE_ROOTS = ["localStorage", "sessionStorage", "cookieStore", "indexedDB", "caches", "credentials"];
 
 export interface ProbeSearchHit extends ProbeObject {
   path: string;
@@ -124,10 +140,11 @@ export interface ProbeHelpers {
    * open root, so a root-scoped candidate stays usable by the other probes).
    * Mirrors shared/stable-selector.ts (the annotate overlay's generator) with
    * the same preference order — unique id → semantic attribute → short
-   * ancestor path with :nth-of-type tiebreaks — duplicated because probe code
-   * crosses into the page via fn.toString() and must stay self-contained;
-   * keep the two in sync. Candidates are re-verified by the agent with
-   * query_elements before anything is built on them.
+   * ancestor path with :nth-of-type tiebreaks — duplicated from the days when
+   * probe code crossed into the page as fn.toString() text and could import
+   * nothing; merging the two is still open, so keep them in sync. Candidates
+   * are re-verified by the agent with query_elements before anything is built
+   * on them.
    */
   stableSelectorFor(element: Element): string;
   /**
@@ -138,13 +155,29 @@ export interface ProbeHelpers {
    */
   registrableDomain(host: string): string;
   /**
-   * Deterministic resource classification for the network probes: "data" (the
-   * page's own fetch/XHR traffic and anything typed JSON/XML), "document"
-   * (HTML/frames), "asset" (scripts, styles, images, fonts, media), "other".
-   * Inputs are what resource timing exposes; contentType may be "" cross-origin
-   * without Timing-Allow-Origin, in which case the initiator decides.
+   * Deterministic resource classification for the network probes and the
+   * capture's census (wiki/design/network-probes.md): "data" is a JSON or
+   * XML response from any initiator, or a fetch/XHR response whose content
+   * type is text or not exposed; a fetch/XHR of an image, font, media or
+   * script is an "asset" like the tag-loaded kind; HTML and frames are
+   * "document"; beacons and pings stay "other". contentType may be ""
+   * cross-origin without Timing-Allow-Origin, in which case the initiator
+   * decides.
    */
   classifyNetworkResource(url: string, initiatorType: string, contentType: string): "data" | "document" | "asset" | "other";
+  /**
+   * The token naming this page load (shared/network-ids.ts): minted in this
+   * world on first use, the same value the capture's snapshot reads, gone
+   * when the document goes. Every network id is recorded against it.
+   */
+  pageLoadToken(): string;
+  /**
+   * Host and path shape of a request URL: volatile path segments collapse
+   * (digits to :n, UUIDs to :uuid, long digit-bearing tokens to :id) and the
+   * query keeps its parameter names only, so repeated calls to one API share
+   * a shape and no query value ever reaches the model.
+   */
+  endpointOf(url: string): NetworkEndpoint;
   /**
    * Compact type outline of a parsed JSON value: field names with value TYPES,
    * arrays merged across sampled elements ("key?" = missing from some). Exists
@@ -153,13 +186,52 @@ export interface ProbeHelpers {
    * the soundcloud mix-filter session died on exactly that).
    */
   outlineJson(root: PageValue, maxBytes: number): string;
+  /**
+   * The labelled item a form control belongs to (wiki/design/inspect-probes.md):
+   * for an input/select/textarea inside a <label>, that label; for one named
+   * by label[for], the nearest ancestor (within four hops) that holds both the
+   * control and its label. null for anything else. The inspect probes read
+   * the item in place of the control: the item carries the classes the site's
+   * CSS keys its states on and the markup around the control, which a hidden
+   * input never does (the SoundCloud toggle case).
+   */
+  labelledItemOf(element: Element): LabelledItem | null;
+}
+
+export interface LabelledItem {
+  item: Element;
+  control: Element;
+  via: "enclosing-label" | "label-for";
+}
+
+/** A request URL as the model sees it: host, path pattern with query names, and the pattern alone (the group key). */
+export interface NetworkEndpoint {
+  host: string;
+  path: string;
+  pattern: string;
+  names: string[];
+}
+
+/** A stylesheet the worker fetched for the probe: href from document.styleSheets, body never shown to the model. */
+export interface FetchedProbeStylesheet {
+  href: string;
+  text: string;
 }
 
 /**
- * Shared page-side utilities, serialized alongside each template by the engine
- * and passed as the template's second argument. SELF-CONTAINED like the
- * templates (fn.toString() crosses into the page); takes NO model input — the
- * needle/limits arrive through the template's JSON-encoded params.
+ * inspect_design's page-side params: the model's schema plus the sheets the
+ * worker fetched between rounds (worker/page-probes/stylesheets.ts). The
+ * worker always sets fetchedSheets itself, so nothing model-supplied lands
+ * here.
+ */
+export interface InspectDesignProbeParams extends InspectDesignParamsType {
+  fetchedSheets?: FetchedProbeStylesheet[];
+}
+
+/**
+ * Shared page-side utilities, built fresh for each run and passed as the
+ * template's second argument. Takes NO model input — the needle/limits arrive
+ * through the template's params.
  */
 export function probeHelpers(): ProbeHelpers {
   const capString = (value: string, max: number): string => (value.length > max ? `${value.slice(0, max)}…` : value);
@@ -203,9 +275,8 @@ export function probeHelpers(): ProbeHelpers {
   };
   const searchJson = (root: PageValue, needle: string | number): ProbeSearchHit[] => {
     // Storage/credential roots are never walked, even when a search reaches one
-    // as a nested key (C3). Inlined here for the same fn.toString() reason as
-    // the read_page_state template.
-    const DENIED_KEYS = ["localStorage", "sessionStorage", "cookieStore", "indexedDB", "caches", "credentials"];
+    // as a nested key (C3).
+    const DENIED_KEYS = DENIED_STATE_ROOTS;
     const hits: ProbeSearchHit[] = [];
     const seen = new Set<PageValue>();
     let budget = 50_000;
@@ -463,15 +534,41 @@ export function probeHelpers(): ProbeHelpers {
     if (url.slice(0, 5) === "data:") return "asset";
     const type = contentType.toLowerCase();
     if (type.includes("json") || type.includes("xml")) return "data";
-    // The page's own code asked for it — that's what "looks like a data
-    // request" means, regardless of an empty or text/* content type.
-    if (initiatorType === "fetch" || initiatorType === "xmlhttprequest") return "data";
+    if (initiatorType === "fetch" || initiatorType === "xmlhttprequest") {
+      // The page's own code asked for it. Text, or a type the browser does
+      // not expose, is data; a fetched image, font, media file or script is
+      // an asset like the tag-loaded kind.
+      if (type.length === 0) return "data";
+      if (type.slice(0, 5) === "text/" && !type.includes("css") && !type.includes("javascript")) return "data";
+      return "asset";
+    }
     if (type.includes("html") || initiatorType === "iframe" || initiatorType === "frame") return "document";
     if (type.length > 0) return "asset";
     if (["script", "link", "css", "img", "image", "font", "video", "audio", "track", "embed", "object", "input", "use"].includes(initiatorType)) {
       return "asset";
     }
     return "other";
+  };
+  const pageLoadToken = (): string => currentPageLoadToken();
+  const endpointOf = (rawUrl: string): NetworkEndpoint => {
+    let url: URL;
+    try {
+      url = new URL(rawUrl);
+    } catch {
+      return { host: "(unparseable)", path: "(unparseable)", pattern: "(unparseable)", names: [] };
+    }
+    const pattern = url.pathname
+      .split("/")
+      .map((segment) => {
+        if (/^\d+$/.test(segment)) return ":n";
+        if (/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(segment)) return ":uuid";
+        if (segment.length >= 16 && /\d/.test(segment) && /^[\w.~%-]+$/.test(segment)) return ":id";
+        return segment;
+      })
+      .join("/");
+    const names = Array.from(new Set(Array.from(url.searchParams.keys()))).sort();
+    const path = capString(names.length > 0 ? `${pattern}?${names.join(",")}` : pattern, 200);
+    return { host: url.hostname, path, pattern, names };
   };
   const outlineJson = (root: PageValue, maxBytes: number): string => {
     let spent = 0;
@@ -522,7 +619,35 @@ export function probeHelpers(): ProbeHelpers {
     const rendered = outline(root, 0);
     return rendered.length > maxBytes ? `${rendered.slice(0, maxBytes)}…` : rendered;
   };
-  return { capString, searchJson, serializeCapped, queryAllDeep, stableSelectorFor, registrableDomain, classifyNetworkResource, outlineJson };
+  const labelledItemOf = (element: Element): LabelledItem | null => {
+    if (!element.matches("input, select, textarea")) return null;
+    const enclosing = element.closest("label");
+    if (enclosing) return { item: enclosing, control: element, via: "enclosing-label" };
+    // SAFETY: the matches() guard above admits only input/select/textarea, and all three expose the labels list.
+    const labels = (element as HTMLInputElement).labels;
+    const label = labels && labels.length > 0 ? labels[0] : null;
+    if (!label) return null;
+    let ancestor = element.parentElement;
+    for (let hops = 0; hops < 4 && ancestor; hops += 1) {
+      if (ancestor === document.body || ancestor === document.documentElement) break;
+      if (ancestor.contains(label)) return { item: ancestor, control: element, via: "label-for" };
+      ancestor = ancestor.parentElement;
+    }
+    return null;
+  };
+  return {
+    capString,
+    searchJson,
+    serializeCapped,
+    queryAllDeep,
+    stableSelectorFor,
+    registrableDomain,
+    classifyNetworkResource,
+    pageLoadToken,
+    endpointOf,
+    outlineJson,
+    labelledItemOf,
+  };
 }
 
 export function queryElementsProbe(params: QueryElementsParamsType, helpers: ProbeHelpers): ProbeResult {
@@ -539,8 +664,12 @@ export function queryElementsProbe(params: QueryElementsParamsType, helpers: Pro
     if (fields.includes("tag")) out.tag = element.tagName.toLowerCase();
     if (fields.includes("text")) out.text = cap((element.textContent ?? "").replace(/\s+/g, " ").trim(), 500);
     if (fields.includes("attributes")) {
+      // A password field's value never reaches the model (shared/sensitive-fields.ts).
+      const secret = isSensitiveField(element);
       const attributes: Record<string, string> = {};
-      for (const attribute of Array.from(element.attributes)) attributes[attribute.name] = cap(attribute.value, 200);
+      for (const attribute of Array.from(element.attributes)) {
+        attributes[attribute.name] = secret && attribute.name.toLowerCase() === "value" ? "" : cap(attribute.value, 200);
+      }
       out.attributes = attributes;
     }
     if (fields.includes("dataset")) {
@@ -649,7 +778,11 @@ export function searchElementsProbe(params: SearchElementsParamsType, helpers: P
       return;
     }
     let recorded = false;
+    // A password field's value is never searched or reported, so a needle
+    // cannot be used to read one back a character at a time.
+    const secret = isSensitiveField(element);
     for (const attribute of Array.from(element.attributes)) {
+      if (secret && attribute.name.toLowerCase() === "value") continue;
       if (attribute.value.toLowerCase().includes(needle)) {
         record(element, `attribute:${attribute.name}`, attribute.value);
         recorded = true;
@@ -691,10 +824,20 @@ export function searchElementsProbe(params: SearchElementsParamsType, helpers: P
 export function inspectElementProbe(params: InspectElementParamsType, helpers: ProbeHelpers): ProbeResult {
   const index = params.index ?? 0;
   const matches = helpers.queryAllDeep(params.selector);
-  const element = matches[index];
-  if (!element) return { found: false, total: matches.length };
+  const matched = matches[index];
+  if (!matched) return { found: false, total: matches.length };
+  // A form control inside its label is read as the label's item: the item
+  // carries the classes and the neighbouring markup the control lacks.
+  const labelled = helpers.labelledItemOf(matched);
+  const element = labelled ? labelled.item : matched;
+  const describe = (target: Element): ProbeObject => {
+    const summary: ProbeObject = { tag: target.tagName.toLowerCase(), classes: Array.from(target.classList) };
+    if (target.id) summary.id = target.id;
+    return summary;
+  };
+  const capHtml = (html: string): [string, boolean] => [html.length > 8192 ? `${html.slice(0, 8192)}…` : html, html.length > 8192];
   const rect = element.getBoundingClientRect();
-  const outerHtml = element.outerHTML;
+  const outerHtml = markupWithoutSecrets(element, "outer");
   const isIframe = element instanceof HTMLIFrameElement;
   // Cross-origin frame content is unreachable: contentDocument is null (or
   // access throws in some engines). Either way the flag reads true.
@@ -706,7 +849,8 @@ export function inspectElementProbe(params: InspectElementParamsType, helpers: P
       crossOriginFrame = true;
     }
   }
-  return {
+  const [cappedHtml, htmlTruncated] = capHtml(outerHtml);
+  const result: ProbeResult = {
     found: true,
     total: matches.length,
     tag: element.tagName.toLowerCase(),
@@ -723,23 +867,40 @@ export function inspectElementProbe(params: InspectElementParamsType, helpers: P
     isCanvas: element instanceof HTMLCanvasElement,
     isIframe,
     crossOriginFrame,
-    outerHtml: outerHtml.length > 8192 ? `${outerHtml.slice(0, 8192)}…` : outerHtml,
-    outerHtmlTruncated: outerHtml.length > 8192,
+    outerHtml: cappedHtml,
+    outerHtmlTruncated: htmlTruncated,
   };
+  if (labelled) {
+    result.redirected = {
+      from: describe(labelled.control),
+      to: describe(element),
+      reason:
+        labelled.via === "enclosing-label"
+          ? "the matched control sits inside this label; the label is the item the page styles and the exemplar to copy"
+          : "the matched control is named by a label[for]; this is the nearest element holding both, the item to copy",
+    };
+    // The item's siblings inside the nearest container: the text label next
+    // to a switch, its spacing classes, the wrapper the site lays them out in.
+    const container = element.parentElement;
+    if (container && container !== document.body && container !== document.documentElement) {
+      const [containerHtml, containerTruncated] = capHtml(markupWithoutSecrets(container, "outer"));
+      result.container = { ...describe(container), outerHtml: containerHtml, outerHtmlTruncated: containerTruncated };
+    }
+  }
+  return result;
 }
 
 /**
  * The design-context read behind the prompt's "design before you build" step:
  * one call answers both "what does this page's own control look like" (curated
  * computed-style digest + the design tokens in scope) and "does my control
- * have room here" (element/parent/sibling geometry). Property lists are
- * inlined — the template is fn.toString()-serialized like the others.
+ * have room here" (element/parent/sibling geometry).
  *
  * With "properties" it is instead the targeted verification read (the job the
  * retired get_computed_style tool did): exactly those computed values, from
  * the element or its ::before/::after pseudo-element, no digest work.
  */
-export function inspectDesignProbe(params: InspectDesignParamsType, helpers: ProbeHelpers): ProbeResult {
+export function inspectDesignProbe(params: InspectDesignProbeParams, helpers: ProbeHelpers): ProbeResult {
   const index = params.index ?? 0;
   const ancestorCount = Math.min(Math.max(params.ancestors ?? 2, 0), 5);
   const cap = (value: string, max: number): string => (value.length > max ? `${value.slice(0, max)}…` : value);
@@ -750,16 +911,22 @@ export function inspectDesignProbe(params: InspectDesignParamsType, helpers: Pro
     height: Math.round(rect.height),
   });
   const matches = helpers.queryAllDeep(params.selector);
-  const element = matches[index];
-  if (!element) return { found: false, total: matches.length };
+  const matched = matches[index];
+  if (!matched) return { found: false, total: matches.length };
   if (params.properties) {
-    const style = getComputedStyle(element, params.pseudoElement ?? null);
+    // The targeted read is exact by design: it reads the element asked for,
+    // never a redirected one.
+    const style = getComputedStyle(matched, params.pseudoElement ?? null);
     const values: Record<string, string> = {};
     for (const property of params.properties.slice(0, 50)) values[property] = style.getPropertyValue(property);
-    const targeted: ProbeResult = { found: true, total: matches.length, tag: element.tagName.toLowerCase(), values };
+    const targeted: ProbeResult = { found: true, total: matches.length, tag: matched.tagName.toLowerCase(), values };
     if (params.pseudoElement) targeted.pseudoElement = params.pseudoElement;
     return targeted;
   }
+  // The digest reads the labelled item, not the control inside it: the item
+  // is what the page paints and what its state classes land on.
+  const labelled = helpers.labelledItemOf(matched);
+  const element = labelled ? labelled.item : matched;
   // Values at their initial defaults carry no design information; omitting
   // them keeps the digest dense enough to read at a glance.
   const isTrivial = (value: string): boolean => {
@@ -816,9 +983,11 @@ export function inspectDesignProbe(params: InspectDesignParamsType, helpers: Pro
     "overflow",
     "width",
   ];
+  // Every class, uncapped: a state class is often the fourth one on the
+  // element (SoundCloud's label carried sc-toggle-on after three others).
   const summarize = (target: Element) => ({
     tag: target.tagName.toLowerCase(),
-    classes: Array.from(target.classList).slice(0, 3),
+    classes: Array.from(target.classList),
     rect: roundRect(target.getBoundingClientRect()),
   });
   const ancestors: ProbeObject[] = [];
@@ -890,9 +1059,23 @@ export function inspectDesignProbe(params: InspectDesignParamsType, helpers: Pro
       presentClasses.add(name);
       if (stems.length < 24 && !stems.includes(name)) stems.push(name);
     };
+    // Stems seed the family: the item's own classes, its labelled control's,
+    // and those of descendants that carry a state gate (a checked/expanded
+    // attribute). Every other descendant class is present context, not a
+    // stem: seeding from all of them let utility classes like
+    // sc-visuallyhidden pull unrelated rules into the family.
+    const stateGateAttribute =
+      /^(?:checked|selected|disabled|open|aria-(?:checked|pressed|selected|expanded|disabled|current|invalid|busy)|data-(?:state|checked|selected|active|open|expanded|pressed|on|toggled))$/;
+    const carriesStateGate = (node: Element): boolean =>
+      Array.from(node.attributes).some((attribute) => stateGateAttribute.test(attribute.name));
     for (const name of Array.from(element.classList)) addStem(name);
-    for (const node of Array.from(element.querySelectorAll("*")).slice(0, 40)) {
-      for (const name of Array.from(node.classList)) addStem(name);
+    if (labelled) for (const name of Array.from(labelled.control.classList)) addStem(name);
+    for (const node of Array.from(element.querySelectorAll("*")).slice(0, 200)) {
+      if (carriesStateGate(node)) {
+        for (const name of Array.from(node.classList)) addStem(name);
+      } else {
+        for (const name of Array.from(node.classList)) presentClasses.add(name);
+      }
     }
     // Ancestor classes are context a matching selector may legitimately name
     // (".stream__filter .sc-toggle") — present, but not family stems.
@@ -902,9 +1085,12 @@ export function inspectDesignProbe(params: InspectDesignParamsType, helpers: Pro
       contextAncestor = contextAncestor.parentElement;
     }
     if (stems.length === 0) return null;
-    // A selector belongs to the family when one of its class tokens is a stem
-    // or a separator-suffixed extension of one ("sc-toggle" claims
-    // ".sc-toggle-on" and ".sc-toggle__handle", not ".sc-toggler").
+    // A selector belongs to the family when one of the class tokens in its
+    // SUBJECT compound (the last compound of a complex selector, the element
+    // the rule paints) is a stem or a separator-suffixed extension of one
+    // ("sc-toggle" claims ".sc-toggle-on" and ".sc-toggle__handle", not
+    // ".sc-toggler"). A family token in an ancestor position
+    // (".sc-toggle .badge") paints something else and is left out.
     const classTokenPattern = /\.((?:[-\w]|\\.)+)/g;
     const classTokensOf = (selectorText: string): string[] => {
       const tokens: string[] = [];
@@ -914,8 +1100,60 @@ export function inspectDesignProbe(params: InspectDesignParamsType, helpers: Pro
       }
       return tokens;
     };
+    const subjectCompoundsOf = (selectorText: string): string[] => {
+      const compounds: string[] = [];
+      let subjectStart = 0;
+      let parenDepth = 0;
+      let inAttribute = false;
+      let quote = "";
+      for (let position = 0; position < selectorText.length; position += 1) {
+        const char = selectorText[position];
+        if (quote) {
+          if (char === "\\") position += 1;
+          else if (char === quote) quote = "";
+          continue;
+        }
+        if (char === "\\") {
+          position += 1;
+          continue;
+        }
+        if (char === '"' || char === "'") {
+          quote = char;
+          continue;
+        }
+        if (inAttribute) {
+          if (char === "]") inAttribute = false;
+          continue;
+        }
+        if (char === "[") {
+          inAttribute = true;
+          continue;
+        }
+        if (char === "(") {
+          parenDepth += 1;
+          continue;
+        }
+        if (char === ")") {
+          parenDepth = Math.max(parenDepth - 1, 0);
+          continue;
+        }
+        if (parenDepth > 0) continue;
+        if (char === ",") {
+          compounds.push(selectorText.slice(subjectStart, position));
+          subjectStart = position + 1;
+          continue;
+        }
+        if (char === " " || char === "\t" || char === "\n" || char === ">" || char === "+" || char === "~") {
+          subjectStart = position + 1;
+        }
+      }
+      compounds.push(selectorText.slice(subjectStart));
+      return compounds;
+    };
     const inFamily = (token: string): boolean =>
       stems.some((stem) => token === stem || token.startsWith(`${stem}-`) || token.startsWith(`${stem}_`));
+    const paintsFamily = (selectorText: string): boolean =>
+      subjectCompoundsOf(selectorText).some((compound) => classTokensOf(compound).some(inFamily));
     const paintPattern = /^(background|border|outline|box-shadow|color|opacity|transform|fill|stroke|content|filter|visibility|display|left|right|top|bottom|width|height)/;
     const statePseudoPattern = /:(?:focus-visible|focus-within|placeholder-shown|indeterminate|checked|hover|active|focus|disabled|enabled|open|target)/g;
     const stateAttributePattern = /\[[^\]]*(?:aria-|data-|checked|disabled|selected|pressed|expanded|open)[^\]]*\]/g;
@@ -929,7 +1167,62 @@ export function inspectDesignProbe(params: InspectDesignParamsType, helpers: Pro
     let visited = 0;
     let unreadableSheets = 0;
     let scanTruncated = false;
-    const visit = (ruleList: CSSRuleList, media: string | null, depth: number) => {
+    // Sheets the page world cannot read (cross-origin: cssRules throws) are
+    // reported by href so the worker can fetch them and run this scan again
+    // with their text (wiki/design/inspect-probes.md). The text arrives as
+    // params.fetchedSheets, is parsed into a constructed stylesheet whose
+    // rules are readable by definition, and never leaves this scan.
+    const fetchedByHref = new Map<string, string>();
+    for (const sheet of params.fetchedSheets ?? []) fetchedByHref.set(sheet.href, sheet.text);
+    const unreadableSheetHrefs: string[] = [];
+    const fetchedSheetHrefs: string[] = [];
+    const resolveHref = (href: string | null | undefined, base: string | null | undefined): string | null => {
+      if (!href) return null;
+      try {
+        return new URL(href, base ?? document.baseURI).href;
+      } catch {
+        return null;
+      }
+    };
+    const recordUnreadable = (href: string | null) => {
+      if (href === null || !/^https?:/.test(href)) return;
+      if (unreadableSheetHrefs.length < 16 && !unreadableSheetHrefs.includes(href)) unreadableSheetHrefs.push(href);
+    };
+    // @import inside a fetched sheet: replaceSync drops import rules, so the
+    // targets are read from the text and go through the same path (scanned
+    // when their text was fetched, reported for one more round when not).
+    const importPattern = /@import\s+(?:url\(\s*(?:"([^"]*)"|'([^']*)'|([^)\s]*))\s*\)|"([^"]*)"|'([^']*)')/g;
+    const scannedHrefs = new Set<string>();
+    function scanFetched(href: string, text: string): void {
+      if (scannedHrefs.has(href)) return;
+      scannedHrefs.add(href);
+      let constructed: CSSStyleSheet;
+      try {
+        constructed = new CSSStyleSheet();
+        constructed.replaceSync(text);
+      } catch {
+        unreadableSheets += 1;
+        return;
+      }
+      fetchedSheetHrefs.push(href);
+      visit(constructed.cssRules, null, 0);
+      for (const match of text.matchAll(importPattern)) {
+        const target = resolveHref(match[1] ?? match[2] ?? match[3] ?? match[4] ?? match[5], href);
+        if (target !== null && !scannedHrefs.has(target)) scanUnreadable(target);
+      }
+    }
+    // A sheet whose rules cannot be read: scan its fetched text when the
+    // worker supplied it, otherwise count it and ask for it by href.
+    function scanUnreadable(href: string | null): void {
+      const text = href === null ? undefined : fetchedByHref.get(href);
+      if (href !== null && text !== undefined) {
+        scanFetched(href, text);
+        return;
+      }
+      unreadableSheets += 1;
+      recordUnreadable(href);
+    }
+    function visit(ruleList: CSSRuleList, media: string | null, depth: number): void {
       if (depth > 4 || scanTruncated) return;
       for (const rule of Array.from(ruleList)) {
         visited += 1;
@@ -941,13 +1234,24 @@ export function inspectDesignProbe(params: InspectDesignParamsType, helpers: Pro
           visit(rule.cssRules, rule.conditionText, depth + 1);
           continue;
         }
+        if (rule instanceof CSSImportRule) {
+          let imported: CSSRuleList | undefined;
+          try {
+            imported = rule.styleSheet?.cssRules;
+          } catch {
+            imported = undefined;
+          }
+          if (imported) visit(imported, rule.media.mediaText || media, depth + 1);
+          else scanUnreadable(rule.styleSheet?.href ?? resolveHref(rule.href, rule.parentStyleSheet?.href));
+          continue;
+        }
         if (!(rule instanceof CSSStyleRule)) {
           if (rule instanceof CSSGroupingRule) visit(rule.cssRules, media, depth + 1);
           continue;
         }
         const selectorText = rule.selectorText ?? "";
         const tokens = classTokensOf(selectorText);
-        if (tokens.some(inFamily)) {
+        if (paintsFamily(selectorText)) {
           const paint: Record<string, string> = {};
           let paintCount = 0;
           for (let position = 0; position < rule.style.length && paintCount < 10; position += 1) {
@@ -978,15 +1282,16 @@ export function inspectDesignProbe(params: InspectDesignParamsType, helpers: Pro
         // Modern engines expose nested rules on CSSStyleRule too.
         if (rule.cssRules.length > 0) visit(rule.cssRules, media, depth + 1);
       }
-    };
+    }
     for (const sheet of Array.from(document.styleSheets)) {
       let ruleList: CSSRuleList;
       try {
         ruleList = sheet.cssRules;
       } catch {
-        // Cross-origin stylesheet — unreadable from here. Counted so the
-        // agent never mistakes "no rule found" for "no rule exists".
-        unreadableSheets += 1;
+        // Cross-origin stylesheet: unreadable from the page world. Counted
+        // (so "no rule found" is never read as "no rule exists") and named
+        // by href so the worker can fetch it for the next round.
+        scanUnreadable(sheet.href);
         continue;
       }
       visit(ruleList, null, 0);
@@ -1005,6 +1310,11 @@ export function inspectDesignProbe(params: InspectDesignParamsType, helpers: Pro
     if (reported.length < collected.length) summary.rulesTruncated = true;
     if (scanTruncated) summary.scanTruncated = true;
     if (unreadableSheets > 0) summary.unreadableSheets = unreadableSheets;
+    // Hrefs only, both ways: what was fetched and scanned, and what is still
+    // unreadable (the worker's fetch list; whatever remains after its rounds
+    // is what no fetch could read).
+    if (fetchedSheetHrefs.length > 0) summary.fetchedSheets = fetchedSheetHrefs;
+    if (unreadableSheetHrefs.length > 0) summary.unreadableSheetHrefs = unreadableSheetHrefs;
     if (gated.length === 0) {
       summary.note =
         "no state-gated paint rules found for this class family — absence is not proof" +
@@ -1017,13 +1327,28 @@ export function inspectDesignProbe(params: InspectDesignParamsType, helpers: Pro
     found: true,
     total: matches.length,
     tag: element.tagName.toLowerCase(),
-    classes: Array.from(element.classList).slice(0, 6),
+    classes: Array.from(element.classList),
     rect: roundRect(element.getBoundingClientRect()),
     style: digestOf(element, lookProperties),
     ancestors,
     customProperties,
     geometry,
   };
+  if (labelled) {
+    const describe = (target: Element): ProbeObject => {
+      const summary: ProbeObject = { tag: target.tagName.toLowerCase(), classes: Array.from(target.classList) };
+      if (target.id) summary.id = target.id;
+      return summary;
+    };
+    result.redirected = {
+      from: describe(labelled.control),
+      to: describe(element),
+      reason:
+        labelled.via === "enclosing-label"
+          ? "the matched control sits inside this label; the label is the item the page styles, so its look and state rules are reported"
+          : "the matched control is named by a label[for]; this is the nearest element holding both, so its look and state rules are reported",
+    };
+  }
   if (stateRules) result.stateRules = stateRules;
   if (customPropertyCount === 0) result.customPropertiesNote = "none enumerable";
   if (customPropertiesTruncated) result.customPropertiesTruncated = true;
@@ -1112,71 +1437,135 @@ export function readStructuredDataProbe(params: ReadStructuredDataParamsType, he
   return result;
 }
 
-export function listNetworkResourcesProbe(params: ListNetworkResourcesParamsType, helpers: ProbeHelpers): ProbeResult {
-  const limit = Math.min(Math.max(params.limit ?? 50, 1), 200);
-  const cap = (value: string, max: number): string => (value.length > max ? `${value.slice(0, max)}…` : value);
+/**
+ * How many endpoint groups a `search` replays in one call: enough to cover
+ * the data endpoints of a typical page load, few enough that a page-wide
+ * search stays a handful of GETs the page already made itself.
+ */
+export const NETWORK_SEARCH_REPLAY_LIMIT = 8;
+
+/** Matches reported per endpoint by a `search`. */
+const NETWORK_SEARCH_MATCH_CAP = 10;
+
+/**
+ * The listing's page-side params: the model's schema plus the worker's own
+ * census switch (the capture asks for every data endpoint group, sized, with
+ * no filter; the model cannot, since the capture already carries that list).
+ */
+export interface ListNetworkResourcesProbeParams extends ListNetworkResourcesParamsType {
+  census?: boolean;
+}
+
+/**
+ * One request as the timeline recorded it, classified. Built once per
+ * listing; the endpoint groups and the flat calls both derive from it.
+ */
+interface RecordedResource {
+  url: string;
+  startTime: number;
+  initiatorType: string;
+  contentType: string;
+  status: number;
+  bytes: number | null;
+  sizeSource: "decoded" | "transfer" | "hidden";
+  kind: "data" | "document" | "asset" | "other";
+  sameSite: boolean;
+  host: string;
+  path: string;
+  pattern: string;
+}
+
+/**
+ * Probe #7 (wiki/design/network-probes.md): what the page fetched, from the
+ * performance resource timeline. The result is the WORKER's view, not the
+ * model's: every endpoint group and call carries its verbatim URL so the
+ * worker can register an id for it, and the worker strips the URLs before
+ * the reply reaches the panel. Three modes, one of which must be chosen
+ * (the no-argument list is the capture's job now):
+ *
+ * - `census` (worker-only) or `urlFilter` or `includeAssets`: endpoint groups
+ *   (host + path shape, newest call first) with counts and sizes.
+ * - `flat`: the individual calls, each its own id.
+ * - `search`: replay the newest call of up to NETWORK_SEARCH_REPLAY_LIMIT
+ *   groups (GET, same anchor rule as replay_network_resource) and report
+ *   which response bodies carry the needle.
+ */
+export async function listNetworkResourcesProbe(
+  params: ListNetworkResourcesProbeParams,
+  helpers: ProbeHelpers,
+): Promise<ProbeResult> {
   const filter = params.urlFilter;
+  const hasMode =
+    params.census === true || filter !== undefined || params.search !== undefined || params.flat === true || params.includeAssets === true;
+  if (!hasMode) {
+    throw new Error(
+      "list_network_resources lists nothing on its own: the capture's Data endpoints section already lists every data " +
+        "endpoint of this page load with its id. Pass urlFilter to narrow by host or path, search to find which " +
+        "endpoint's response carries a value, or flat to see individual calls.",
+    );
+  }
+  // Default sized for orientation, not inventory: the top slice answers
+  // "which endpoints carry data here" in ~1/4 the tokens a 50-row dump did;
+  // an explicit limit (cap 200) is the exhaustive path. The census has no
+  // limit here: the worker keeps the largest and counts the rest.
+  const limit = params.census === true ? 1000 : Math.min(Math.max(params.limit ?? 15, 1), 200);
+  const cap = helpers.capString;
   const all = performance.getEntriesByType("resource");
   const pageSite = helpers.registrableDomain(location.hostname);
   // Page-boundary parses (same tag-check idiom as the other probes): entries
   // come from the page's performance API, whose newer fields
-  // (contentType/responseStatus, recent Chrome) may be absent — and are ""/0
-  // cross-origin without Timing-Allow-Origin — so each is parsed here and the
+  // (contentType/responseStatus, recent Chrome) may be absent, and are ""/0
+  // cross-origin without Timing-Allow-Origin, so each is parsed here and the
   // classifier falls back to the initiator when they carry nothing.
   const asText = (value: PageValue): value is string => Object.prototype.toString.call(value) === "[object String]";
   const asNumber = (value: PageValue): value is number => Object.prototype.toString.call(value) === "[object Number]";
-  const rows = all
-    .map((entry) => {
-      // SAFETY: structural view over a PerformanceEntry — every field is read
-      // behind the tag checks above and never written.
-      const timing = entry as PerformanceEntry & { initiatorType?: PageValue; contentType?: PageValue; responseStatus?: PageValue };
-      const initiatorType = asText(timing.initiatorType) ? timing.initiatorType : "unknown";
-      const contentType = asText(timing.contentType) ? timing.contentType : "";
-      const status = asNumber(timing.responseStatus) ? timing.responseStatus : 0;
-      let host = "";
-      try {
-        host = new URL(entry.name).hostname;
-      } catch {}
-      return {
-        url: entry.name,
-        initiatorType,
-        contentType,
-        status,
-        kind: helpers.classifyNetworkResource(entry.name, initiatorType, contentType),
-        sameSite: host.length > 0 && helpers.registrableDomain(host) === pageSite,
-      };
-    })
-    .filter((row) => filter === undefined || row.url.includes(filter));
-  // Data requests are the discovery target, ranked same-site first (a RANKING
-  // — cross-site APIs are real, so nothing is dropped; Array.prototype.sort
-  // is stable, request order is kept otherwise).
-  const dataRows = rows.filter((row) => row.kind === "data").sort((a, b) => Number(b.sameSite) - Number(a.sameSite));
-  const nonDataRows = rows.filter((row) => row.kind !== "data");
-  // Endpoint template: volatile path segments collapse (pure digits → :n,
-  // UUIDs → :uuid, long digit-bearing tokens → :id — real words rarely carry
-  // digits at that length), so repeated calls to one API group into a single
-  // row. Query names ride along for display only, never in the group key — a
-  // parameter appearing mid-session (offset on page two) must not split the
-  // endpoint. The verbatim URL still rides on each group as lastUrl —
-  // replay_network_resource needs it exact.
-  const endpointOf = (rawUrl: string) => {
-    let url: URL;
-    try {
-      url = new URL(rawUrl);
-    } catch {
-      return { host: "(unparseable)", pathname: cap(rawUrl, 120), names: [] satisfies string[] };
-    }
-    const pathname = url.pathname
-      .split("/")
-      .map((segment) => {
-        if (/^\d+$/.test(segment)) return ":n";
-        if (/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(segment)) return ":uuid";
-        if (segment.length >= 16 && /\d/.test(segment) && /^[\w.~%-]+$/.test(segment)) return ":id";
-        return segment;
-      })
-      .join("/");
-    return { host: url.hostname, pathname, names: Array.from(new Set(Array.from(url.searchParams.keys()))) };
-  };
+  const rows: RecordedResource[] = all.map((entry) => {
+    // SAFETY: structural view over a PerformanceEntry; every field is read
+    // behind the tag checks above and never written.
+    const timing = entry as PerformanceEntry & {
+      initiatorType?: PageValue;
+      contentType?: PageValue;
+      responseStatus?: PageValue;
+      decodedBodySize?: PageValue;
+      transferSize?: PageValue;
+    };
+    const initiatorType = asText(timing.initiatorType) ? timing.initiatorType : "unknown";
+    const contentType = asText(timing.contentType) ? timing.contentType : "";
+    const status = asNumber(timing.responseStatus) ? timing.responseStatus : 0;
+    // Size: the decoded body (what the page parsed) when the browser exposes
+    // it; the transfer size (headers included, and 0 on a cache hit) when only
+    // that is known; hidden when neither is, which is what a cross-origin
+    // response without Timing-Allow-Origin reports.
+    const decoded = asNumber(timing.decodedBodySize) ? timing.decodedBodySize : 0;
+    const transfer = asNumber(timing.transferSize) ? timing.transferSize : 0;
+    const size: Pick<RecordedResource, "bytes" | "sizeSource"> =
+      decoded > 0 ? { bytes: decoded, sizeSource: "decoded" } : transfer > 0 ? { bytes: transfer, sizeSource: "transfer" } : { bytes: null, sizeSource: "hidden" };
+    const endpoint = helpers.endpointOf(entry.name);
+    return {
+      url: entry.name,
+      startTime: entry.startTime,
+      initiatorType,
+      contentType,
+      status,
+      ...size,
+      kind: helpers.classifyNetworkResource(entry.name, initiatorType, contentType),
+      sameSite: endpoint.host !== "(unparseable)" && helpers.registrableDomain(endpoint.host) === pageSite,
+      host: endpoint.host,
+      path: endpoint.path,
+      pattern: endpoint.pattern,
+    };
+  });
+  // The filter matches the verbatim URL and the host + shape the model saw,
+  // so a substring copied from a listing row works even where the shape
+  // replaced an id.
+  const filtered = rows.filter(
+    (row) => filter === undefined || row.url.includes(filter) || `${row.host}${row.path}`.includes(filter),
+  );
+  // Data requests are the discovery target, ranked same-site first (a RANKING:
+  // cross-site APIs are real, so nothing is dropped; Array.prototype.sort is
+  // stable, request order is kept otherwise).
+  const dataRows = filtered.filter((row) => row.kind === "data").sort((a, b) => Number(b.sameSite) - Number(a.sameSite));
+  const nonDataRows = filtered.filter((row) => row.kind !== "data");
   const originCounts = new Map<string, number>();
   for (const row of nonDataRows) {
     let origin = "data:";
@@ -1186,7 +1575,9 @@ export function listNetworkResourcesProbe(params: ListNetworkResourcesParamsType
     originCounts.set(origin, (originCounts.get(origin) ?? 0) + 1);
   }
   const result: ProbeResult = {
-    total: rows.length,
+    pageLoad: helpers.pageLoadToken(),
+    pageUrl: location.href,
+    total: filtered.length,
     dataTotal: dataRows.length,
     // Everything that is not a data request is collapsed to per-origin counts:
     // present (never silently dropped) but not in the way. includeAssets
@@ -1199,67 +1590,130 @@ export function listNetworkResourcesProbe(params: ListNetworkResourcesParamsType
     // Saturated buffer = requests silently missing from this list. 250 is
     // Chrome's default limit; there is no API to read the configured one.
     entryCount: all.length,
-    // 250 = Chrome's default buffer, inlined — serialized probes cannot close
-    // over module scope; see the resource-timing comment near the top of file.
-    bufferPossiblySaturated: all.length >= 250,
+    bufferPossiblySaturated: all.length >= RESOURCE_TIMING_DEFAULT_BUFFER,
   };
+  const sizeOf = (row: RecordedResource): ProbeObject => ({
+    bytes: row.bytes,
+    sizeSource: row.sizeSource,
+    contentType: row.contentType.length > 0 ? cap(row.contentType, 100) : null,
+    status: row.status > 0 ? row.status : null,
+    sameSite: row.sameSite,
+  });
   if (params.flat === true) {
-    result.data = dataRows.slice(0, limit).map((row) => ({
-      url: cap(row.url, 500),
+    result.calls = dataRows.slice(0, limit).map((row) => ({
+      url: row.url,
+      startTime: Math.round(row.startTime),
+      host: row.host,
+      path: row.path,
+      pattern: row.pattern,
       initiatorType: row.initiatorType,
-      contentType: row.contentType.length > 0 ? cap(row.contentType, 100) : null,
-      status: row.status > 0 ? row.status : null,
-      sameSite: row.sameSite,
+      ...sizeOf(row),
     }));
-    result.dataTruncated = dataRows.length > limit;
+    result.callTotal = dataRows.length;
+    result.callsTruncated = dataRows.length > limit;
   } else {
-    // Default view: one row per endpoint. dataRows is sameSite-ranked but
-    // stable within a host, so each group's last-seen row is its most recent
-    // request — lastUrl is that URL verbatim (replay-safe).
-    const groups = new Map<
-      string,
-      { host: string; pathname: string; names: string[]; count: number; statuses: number[]; contentType: string; sameSite: boolean; lastUrl: string }
-    >();
+    // One row per endpoint. dataRows is sameSite-ranked but stable within a
+    // host, so each group's last-seen row is its most recent request: that
+    // URL is the one the group's id replays.
+    interface EndpointGroup {
+      host: string;
+      path: string;
+      pattern: string;
+      count: number;
+      statuses: number[];
+      contentType: string;
+      sameSite: boolean;
+      url: string;
+      bytes: number;
+      sized: number;
+      decoded: number;
+    }
+    const groups = new Map<string, EndpointGroup>();
     for (const row of dataRows) {
-      const endpoint = endpointOf(row.url);
-      const key = `${endpoint.host} ${endpoint.pathname}`;
+      const key = `${row.host} ${row.pattern}`;
       const group = groups.get(key) ?? {
-        host: endpoint.host,
-        pathname: endpoint.pathname,
-        names: [],
+        host: row.host,
+        path: row.path,
+        pattern: row.pattern,
         count: 0,
         statuses: [],
         contentType: "",
         sameSite: row.sameSite,
-        lastUrl: "",
+        url: "",
+        bytes: 0,
+        sized: 0,
+        decoded: 0,
       };
       group.count += 1;
-      for (const name of endpoint.names) {
-        if (!group.names.includes(name) && group.names.length < 20) group.names.push(name);
-      }
+      // The newest call's query names describe the group; a parameter that
+      // appears mid-session (offset on page two) must not split the endpoint.
+      group.path = row.path;
       if (row.status > 0 && !group.statuses.includes(row.status) && group.statuses.length < 5) group.statuses.push(row.status);
       if (row.contentType.length > 0) group.contentType = row.contentType;
-      group.lastUrl = row.url;
+      if (row.bytes !== null) {
+        group.bytes += row.bytes;
+        group.sized += 1;
+        if (row.sizeSource === "decoded") group.decoded += 1;
+      }
+      group.url = row.url;
       groups.set(key, group);
     }
     const ranked = Array.from(groups.values()).sort(
-      (a, b) => Number(b.sameSite) - Number(a.sameSite) || b.count - a.count,
+      (a, b) => Number(b.sameSite) - Number(a.sameSite) || b.bytes - a.bytes || b.count - a.count,
     );
-    result.endpoints = ranked.slice(0, limit).map((group) => ({
+    const describe = (group: EndpointGroup): ProbeObject => ({
+      url: group.url,
       host: group.host,
-      path: cap(group.names.length > 0 ? `${group.pathname}?${group.names.slice().sort().join(",")}` : group.pathname, 200),
+      path: group.path,
+      pattern: group.pattern,
       count: group.count,
+      bytes: group.sized > 0 ? group.bytes : null,
+      sizeSource: group.sized === 0 ? "hidden" : group.decoded === group.sized ? "decoded" : "transfer",
       statuses: group.statuses,
       contentType: group.contentType.length > 0 ? cap(group.contentType, 100) : null,
       sameSite: group.sameSite,
-      lastUrl: cap(group.lastUrl, 500),
-    }));
-    result.endpointTotal = groups.size;
-    result.endpointsTruncated = groups.size > limit;
+    });
+    if (params.search !== undefined) {
+      // Which endpoint's response carries the value: replay the newest call
+      // of the best-ranked groups (GETs the page already made, its cookies,
+      // its CORS rules) and search each body. Same-site groups and bigger
+      // bodies first, since that is where a feed lives.
+      const needle = params.search;
+      const candidates = ranked.slice(0, NETWORK_SEARCH_REPLAY_LIMIT);
+      const searched = await Promise.all(
+        candidates.map(async (group): Promise<ProbeObject> => {
+          const row = describe(group);
+          try {
+            const response = await fetch(group.url, { method: "GET" });
+            const text = await response.text();
+            row.searchStatus = response.status;
+            try {
+              row.matches = helpers.searchJson(JSON.parse(text), needle).slice(0, NETWORK_SEARCH_MATCH_CAP);
+            } catch {
+              row.matches = [];
+              row.searchError = "response body is not JSON";
+            }
+          } catch (error) {
+            row.searchError = `fetch failed: ${String(error)}`;
+          }
+          return row;
+        }),
+      );
+      // Endpoints with a hit first; the rest stay listed so the model sees what was searched.
+      result.endpoints = searched.sort((a, b) => hitCount(b) - hitCount(a));
+      result.endpointTotal = groups.size;
+      result.searched = candidates.length;
+      result.searchSkipped = groups.size - candidates.length;
+    } else {
+      result.endpoints = ranked.slice(0, limit).map(describe);
+      result.endpointTotal = groups.size;
+      result.endpointsTruncated = groups.size > limit;
+    }
   }
   if (params.includeAssets === true) {
     result.other = nonDataRows.slice(0, limit).map((row) => ({
-      url: cap(row.url, 300),
+      host: row.host,
+      path: row.path,
       initiatorType: row.initiatorType,
       kind: row.kind,
       contentType: row.contentType.length > 0 ? cap(row.contentType, 100) : null,
@@ -1267,6 +1721,10 @@ export function listNetworkResourcesProbe(params: ListNetworkResourcesParamsType
     result.otherTruncated = nonDataRows.length > limit;
   }
   return result;
+}
+
+function hitCount(row: ProbeObject): number {
+  return Array.isArray(row.matches) ? row.matches.length : 0;
 }
 
 /**
@@ -1281,21 +1739,36 @@ export function listNetworkResourcesProbe(params: ListNetworkResourcesParamsType
 export function readPageStateProbe(params: ReadPageStateParamsType, helpers: ProbeHelpers): ProbeResult {
   // Storage and credential roots hold session tokens, not page UI state, and
   // read_page_state is the no-approval lane (C3) — so they are off-limits here.
-  // Inlined, not a module const: this body is fn.toString()-serialized into the
-  // page and cannot close over outer scope.
-  const DENIED_ROOTS = ["localStorage", "sessionStorage", "cookieStore", "indexedDB", "caches", "credentials"];
   const path = params.path ?? [];
-  if (path.length > 0 && DENIED_ROOTS.includes(path[0]!)) {
+  if (path.length > 0 && DENIED_STATE_ROOTS.includes(path[0]!)) {
     return {
       found: false,
       blocked: true,
       reason: `read_page_state does not expose "${path[0]}" — it holds storage or credential data, not page UI state.`,
     };
   }
+  // Built-in browser APIs (navigator, document, location, …) are own ACCESSOR
+  // properties of window; the root copy below reads descriptor.value, which for
+  // an accessor is undefined. Refuse those roots explicitly: a silent undefined
+  // reads as "API not present" — an agent verdict this probe cannot support
+  // either way, since reading the getter would run page code.
+  if (path.length > 0) {
+    const rootDescriptor = Object.getOwnPropertyDescriptor(globalThis, path[0]!);
+    if (rootDescriptor !== undefined && (rootDescriptor.get !== undefined || rootDescriptor.set !== undefined)) {
+      return {
+        found: false,
+        unreadable: true,
+        reason:
+          `"${path[0]}" is an accessor-backed global (a getter, like most built-in browser APIs) — ` +
+          "read_page_state reads plain data properties only. This says nothing about whether the API " +
+          "exists or what it holds; do not feature-detect browser APIs with this probe.",
+      };
+    }
+  }
   const maxDepth = Math.min(Math.max(params.maxDepth ?? 3, 1), 6);
   const maxBytes = Math.min(Math.max(params.maxBytes ?? 8192, 256), 32_768);
   const isPageObject = (value: PageValue): value is PageObject =>
-    value !== null && !Array.isArray(value) && !(value instanceof Node) && !(value instanceof Function);
+    value !== null && value !== undefined && !Array.isArray(value) && !(value instanceof Node) && !(value instanceof Function);
   // Copy own global properties into the plain-object representation the probe
   // can traverse. The window itself contains host objects beyond PageValue.
   // SAFETY: the copied own-property values are immediately treated as page data and serialized with the same caps as nested state.
@@ -1343,31 +1816,52 @@ export function readPageStateProbe(params: ReadPageStateParamsType, helpers: Pro
 }
 
 /**
- * Probe #9 — feasibility-phase replay with a structural, data-only bound: the
- * URL executes ONLY if that exact URL already appears in the page's resource
- * timeline, checked in-page at execution time. The model cannot fabricate a
- * request — it can only re-issue a GET the page already made itself. No custom
- * headers; capped body. Honesty caveats live in the tool description: a prior
- * page fetch is not proof of side-effect-freedom, and a cookie-bearing replay
- * returns personalized data (untrusted, like every page-data channel).
+ * replay_network_resource's page-side params: the model names an id; the
+ * worker resolves it to the recorded URL and page-load token and sets both
+ * itself (worker-authored, spread last), so nothing model-supplied can name
+ * a URL. Without them the template refuses without fetching.
+ */
+export interface ReplayNetworkResourceProbeParams extends ReplayNetworkResourceParamsType {
+  url?: string;
+  pageLoad?: string;
+}
+
+/**
+ * Probe #9: feasibility-phase replay with two structural, data-only bounds.
+ * The worker resolved the id to a URL it recorded from this tab, and the URL
+ * executes ONLY if the page-load token it was recorded against is this
+ * document's and the exact URL still appears in the page's resource timeline,
+ * both checked in-page at execution time. The model cannot fabricate a
+ * request and cannot get a body from a page other than the one it listed.
+ * No custom headers; capped body. Honesty caveats live in the tool
+ * description: a prior page fetch is not proof of side-effect-freedom, and a
+ * cookie-bearing replay returns personalized data (untrusted, like every
+ * page-data channel).
  */
 export async function replayNetworkResourceProbe(
-  params: ReplayNetworkResourceParamsType,
+  params: ReplayNetworkResourceProbeParams,
   helpers: ProbeHelpers,
 ): Promise<ProbeResult> {
   const maxBytes = Math.min(Math.max(params.maxBytes ?? 16_384, 256), 65_536);
+  if (params.url === undefined || params.pageLoad === undefined) {
+    return {
+      replayed: false,
+      reason: "not-prepared",
+      detail: "the extension resolves an id to its recorded URL before this probe runs; nothing was fetched",
+    };
+  }
+  if (params.pageLoad !== helpers.pageLoadToken()) {
+    // A different document from the one that listed this id: refuse before
+    // any request, so a body never comes from a page the model did not list.
+    return { replayed: false, reason: "stale-id" };
+  }
   const entries = performance.getEntriesByType("resource");
   if (!entries.some((entry) => entry.name === params.url)) {
     return {
       replayed: false,
       reason: "url-not-recorded",
-      detail:
-        "replay only re-issues GETs whose exact URL already appears in this page's resource timeline; " +
-        "check list_network_resources for the exact URL (including its query string)",
       entryCount: entries.length,
-      // 250 = Chrome's default buffer, inlined — serialized probes cannot close
-      // over module scope; see the resource-timing comment near the top of file.
-      bufferPossiblySaturated: entries.length >= 250,
+      bufferPossiblySaturated: entries.length >= RESOURCE_TIMING_DEFAULT_BUFFER,
     };
   }
   let response: Response;
@@ -1378,9 +1872,11 @@ export async function replayNetworkResourceProbe(
   } catch (error) {
     return { replayed: false, reason: "fetch-failed", message: String(error) };
   }
+  const endpoint = helpers.endpointOf(params.url);
   const result: ProbeObject = {
     replayed: true,
-    url: params.url,
+    host: endpoint.host,
+    path: endpoint.path,
     status: response.status,
     contentType: response.headers.get("content-type"),
     totalChars: text.length,
@@ -1538,18 +2034,51 @@ export function observeNetworkBodiesProbe(
 }
 
 /**
+ * click_element's page-side params: the model names a selector; the WORKER
+ * adds the click rights (worker/index.ts clickProbeParams over worker/box.ts
+ * clickRightsFor) after schema validation, spread last, so nothing
+ * model-supplied can shadow them and the model-facing schema
+ * (shared/probe-schemas.ts) declares neither. Without them only same-origin
+ * clicks pass, which is the right answer for a page with no boxed remixlet.
+ */
+export interface ClickElementProbeParams extends ClickElementParamsType {
+  /** The `matches` of every boxed remixlet running on this page. */
+  matches?: string[];
+  /** Their `fetch:`-derived granted host patterns. */
+  grantedHosts?: string[];
+}
+
+/**
  * Probe #11 — the ONE deliberately state-changing probe: dispatch a click on a
  * matched element, so a control's interactive behavior can be exercised
  * through the structured lane (click → assert changed state → click → assert
- * restored) instead of the approval-gated evaluate_js. The terra airbnb run
+ * restored). The terra airbnb run
  * shipped a sort pill whose handler was a functional no-op precisely because
  * no sanctioned interaction existed — presence/look assertions cannot catch a
  * dead handler. Same injection invariant as every template: the selector
  * arrives as JSON data, never code, and an invalid selector throws like
  * querySelectorAll. The click is synthetic (isTrusted: false) — a remixlet's
  * own handlers never check that, but a host control might ignore it.
+ *
+ * The click goes through the SAME rule remixlet code's `dom.click()` obeys
+ * (`clickDecision` in src/box/policy.ts, judged by what the click activates):
+ * a click that would navigate off-site or submit an off-site form is refused
+ * before it is dispatched, and the refusal comes back as a result rather than
+ * an error, so the model reads what happened and moves on. There is no
+ * ownership limit: verifying that a remixlet changed what a site's own button
+ * does means clicking the site's own button
+ * (wiki/ops/2026-09-12-security-review-plan.md, F3).
+ *
+ * `matches` and `grantedHosts` are WORKER-injected after schema validation
+ * (worker/index.ts clickProbeParams): they are the matches and `fetch:` grants
+ * of the boxed remixlets running on this page, so the agent clicks with the
+ * rights the remixlet it is verifying has. The model neither sees nor controls
+ * them: the model-facing schema does not declare them, and the worker spreads
+ * its values last, so a model-supplied field of the same name cannot shadow
+ * them. With no boxed remixlet on the page both are empty and only same-origin
+ * clicks pass.
  */
-export function clickElementProbe(params: ClickElementParamsType, helpers: ProbeHelpers): ProbeResult {
+export function clickElementProbe(params: ClickElementProbeParams, helpers: ProbeHelpers): ProbeResult {
   const index = params.index ?? 0;
   const matches = helpers.queryAllDeep(params.selector);
   const element = matches[index];
@@ -1561,6 +2090,11 @@ export function clickElementProbe(params: ClickElementParamsType, helpers: Probe
     const rect = element.getBoundingClientRect();
     visible = rect.width > 0 && rect.height > 0;
   }
+  const decision = clickDecision(element, clickUrlContext(params));
+  const tag = element.tagName.toLowerCase();
+  if (decision.kind === "refuse") {
+    return { found: true, total: matches.length, clicked: false, refused: decision.reason, tag, visible };
+  }
   // HTMLElement.click() runs the element's activation behavior (checkbox
   // toggling, label forwarding) as well as listeners; the MouseEvent fallback
   // covers SVG and other non-HTML elements.
@@ -1569,7 +2103,142 @@ export function clickElementProbe(params: ClickElementParamsType, helpers: Probe
   } else {
     element.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true, view: window }));
   }
-  return { found: true, total: matches.length, clicked: true, tag: element.tagName.toLowerCase(), visible };
+  return { found: true, total: matches.length, clicked: true, tag, visible };
+}
+
+/**
+ * The vetting context for one click: this document's own URL and base, the
+ * worker's rights, and the page's own resource URLs read lazily (only an
+ * off-site, un-granted destination pays for the collection) and once per
+ * click, since the two checks can both ask for it.
+ */
+function clickUrlContext(params: ClickElementProbeParams): UrlContext {
+  let pageUrls: ReadonlySet<string> | undefined;
+  return {
+    pageUrl: location.href,
+    baseUrl: document.baseURI,
+    matches: Array.isArray(params.matches) ? params.matches : [],
+    grantedHosts: Array.isArray(params.grantedHosts) ? params.grantedHosts : [],
+    pageUrls: () => (pageUrls ??= pageResourceUrls(document, window)),
+  };
+}
+
+/**
+ * The page-side half of look_at_change (wiki/design/look-review.md): bring the
+ * added element into view, and report the rectangles the worker crops from
+ * one captureVisibleTab — the element, its context ancestor, and (when given)
+ * the host exemplar with its own context. It scrolls (the one sanctioned
+ * side effect besides click_element: a crop of something off-screen is
+ * impossible) and reads geometry; it never judges the look. Two animation
+ * frames after a scroll let sticky headers and lazy paint settle.
+ *
+ * Context ancestor: "row" is the nearest ancestor at least three times as
+ * wide as the element (capped at 5 levels), "container" the nearest ancestor
+ * that paints a background or border, "element" the element itself. Context
+ * rects are clipped to the viewport — the capture cannot see further.
+ */
+export async function locateForReviewProbe(params: LocateForReviewParamsType, helpers: ProbeHelpers): Promise<ProbeResult> {
+  const context = params.context ?? "row";
+  const viewport = { width: window.innerWidth, height: window.innerHeight };
+  const roundRect = (rect: { x: number; y: number; width: number; height: number }) => ({
+    x: Math.round(rect.x),
+    y: Math.round(rect.y),
+    width: Math.round(rect.width),
+    height: Math.round(rect.height),
+  });
+  const clipToViewport = (rect: DOMRect) => {
+    const x = Math.max(0, rect.left);
+    const y = Math.max(0, rect.top);
+    const right = Math.min(viewport.width, rect.right);
+    const bottom = Math.min(viewport.height, rect.bottom);
+    return { x, y, width: Math.max(0, right - x), height: Math.max(0, bottom - y) };
+  };
+  const inViewport = (rect: DOMRect): boolean =>
+    rect.width > 0 &&
+    rect.height > 0 &&
+    rect.top >= 0 &&
+    rect.left >= 0 &&
+    rect.bottom <= viewport.height &&
+    rect.right <= viewport.width;
+  const isVisible = (element: Element): boolean => {
+    if (element.checkVisibility) return element.checkVisibility();
+    const rect = element.getBoundingClientRect();
+    return rect.width > 0 && rect.height > 0;
+  };
+  const paintsSurface = (element: Element): boolean => {
+    const style = getComputedStyle(element);
+    const background = style.getPropertyValue("background-color");
+    if (background !== "" && background !== "rgba(0, 0, 0, 0)" && background !== "transparent") return true;
+    if (style.getPropertyValue("background-image") !== "none") return true;
+    for (const side of ["top", "right", "bottom", "left"]) {
+      const width = Number.parseFloat(style.getPropertyValue(`border-${side}-width`)) || 0;
+      const lineStyle = style.getPropertyValue(`border-${side}-style`);
+      if (width > 0 && lineStyle !== "none" && lineStyle !== "hidden") return true;
+    }
+    return false;
+  };
+  const contextAncestor = (element: Element): Element => {
+    if (context === "element") return element;
+    const own = element.getBoundingClientRect();
+    let ancestor = element.parentElement;
+    for (let depth = 0; depth < (context === "row" ? 5 : 8) && ancestor && ancestor !== document.body; depth += 1) {
+      const rect = ancestor.getBoundingClientRect();
+      if (context === "row") {
+        if (rect.width >= own.width * 3 && rect.height > 0) return ancestor;
+      } else if (paintsSurface(ancestor)) {
+        return ancestor;
+      }
+      ancestor = ancestor.parentElement;
+    }
+    return element;
+  };
+  const settle = async (): Promise<void> => {
+    await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+  };
+  const describe = (element: Element, scrolled: boolean) => {
+    const rect = element.getBoundingClientRect();
+    const ancestor = contextAncestor(element);
+    const contextRect = clipToViewport(ancestor.getBoundingClientRect());
+    return {
+      tag: element.tagName.toLowerCase(),
+      rect: roundRect(clipToViewport(rect)),
+      fullRect: roundRect(rect),
+      contextRect: roundRect(contextRect.width > 0 && contextRect.height > 0 ? contextRect : clipToViewport(rect)),
+      contextTag: ancestor.tagName.toLowerCase(),
+      inViewport: inViewport(rect),
+      visible: isVisible(element),
+      scrolled,
+    };
+  };
+
+  const subjects = helpers.queryAllDeep(params.selector);
+  const subject = subjects[0];
+  const result: ProbeResult = {
+    devicePixelRatio: window.devicePixelRatio || 1,
+    viewport,
+    context,
+    subjectTotal: subjects.length,
+  };
+  if (!subject) {
+    result.subject = null;
+    return result;
+  }
+  let reference: Element | undefined;
+  if (params.referenceSelector !== undefined) {
+    const references = helpers.queryAllDeep(params.referenceSelector);
+    reference = references[0];
+    result.referenceTotal = references.length;
+    if (!reference) result.reference = null;
+  }
+  let scrolledSubject = false;
+  if (isVisible(subject) && !inViewport(subject.getBoundingClientRect())) {
+    subject.scrollIntoView({ block: "center", inline: "nearest" });
+    scrolledSubject = true;
+    await settle();
+  }
+  result.subject = describe(subject, scrolledSubject);
+  if (reference) result.reference = describe(reference, false);
+  return result;
 }
 
 export async function assertPageStateProbe(params: AssertPageStateParamsType, helpers: ProbeHelpers): Promise<ProbeResult> {
@@ -1609,7 +2278,7 @@ export async function assertPageStateProbe(params: AssertPageStateParamsType, he
         case "attr-equals": {
           if (!first) return { pass: false, actual: "no match" };
           if (!assertion.name) return { pass: false, actual: 'attr-equals requires "name" (the attribute)' };
-          const actual = first.getAttribute(assertion.name);
+          const actual = isSensitiveField(first) && assertion.name.toLowerCase() === "value" ? "" : first.getAttribute(assertion.name);
           return { pass: actual === String(assertion.expected ?? ""), actual: actual === null ? "(absent)" : actual };
         }
         case "style-equals": {
@@ -1643,116 +2312,6 @@ export async function assertPageStateProbe(params: AssertPageStateParamsType, he
           const mine = getComputedStyle(first).getPropertyValue(assertion.name);
           const reference = getComputedStyle(other).getPropertyValue(assertion.name);
           return { pass: mine === reference, actual: `${mine} vs ${reference}` };
-        }
-        case "design-parity": {
-          // The whole curated look digest inspect_design reads, compared in
-          // one assertion — so one flattering property can no longer stand in
-          // for "matches the host". A control's visible state is usually
-          // painted on descendants (a toggle's handle) or ::before/::after
-          // (its track), not the element itself — the SoundCloud mixes-toggle
-          // session passed element-only parity between an off and an on
-          // toggle because both labels computed identical styles — so the
-          // comparison covers all three layers. Failure output names every
-          // diverging location and property, actionable in the same turn.
-          if (!first) return { pass: false, actual: "no match" };
-          if (!assertion.otherSelector) {
-            return { pass: false, actual: 'design-parity requires "otherSelector" (the reference element)' };
-          }
-          let other: Element | undefined;
-          try {
-            other = helpers.queryAllDeep(assertion.otherSelector)[0];
-          } catch (error) {
-            return { pass: false, actual: `invalid otherSelector: ${String(error)}` };
-          }
-          if (!other) return { pass: false, actual: "no match for otherSelector" };
-          const properties = [
-            "font-family",
-            "font-size",
-            "font-weight",
-            "color",
-            "background-color",
-            "border-radius",
-            "height",
-            "padding",
-          ];
-          // Descendants carry the subject's vs the reference's OWN text
-          // ("Mixes" vs "Reposts"), so size/position properties would flag
-          // legitimate text-length differences — paint properties only.
-          const descendantProperties = [
-            "color",
-            "background-color",
-            "background-image",
-            "border",
-            "border-radius",
-            "box-shadow",
-            "opacity",
-            "transform",
-          ];
-          // Pseudo-elements never hold the differing label text, so their
-          // box size is meaningful (a track or knob drawn at a fixed size).
-          const pseudoProperties = [...descendantProperties, "width", "height"];
-          // Exact per-property compare, except pixel-bearing values get a 1px
-          // tolerance per number (sub-pixel rounding): same non-numeric shape,
-          // each number within 1 of its counterpart.
-          const numberPattern = /-?\d+(?:\.\d+)?/g;
-          const nearlyEqual = (mine: string, reference: string): boolean => {
-            if (mine === reference) return true;
-            if (!mine.includes("px") || !reference.includes("px")) return false;
-            const mineNumbers = mine.match(numberPattern);
-            const referenceNumbers = reference.match(numberPattern);
-            if (!mineNumbers || !referenceNumbers || mineNumbers.length !== referenceNumbers.length) return false;
-            if (mine.replace(numberPattern, "#") !== reference.replace(numberPattern, "#")) return false;
-            return mineNumbers.every(
-              (value, position) => Math.abs(Number(value) - Number(referenceNumbers[position])) <= 1,
-            );
-          };
-          const diffs: string[] = [];
-          const compare = (mine: CSSStyleDeclaration, reference: CSSStyleDeclaration, names: string[], where: string) => {
-            for (const property of names) {
-              const mineValue = mine.getPropertyValue(property);
-              const referenceValue = reference.getPropertyValue(property);
-              if (!nearlyEqual(mineValue, referenceValue)) diffs.push(`${where}${property}: ${mineValue} vs ${referenceValue}`);
-            }
-          };
-          const comparePseudos = (mine: Element, reference: Element, where: string) => {
-            for (const pseudo of ["::before", "::after"]) {
-              const mineStyle = getComputedStyle(mine, pseudo);
-              const referenceStyle = getComputedStyle(reference, pseudo);
-              const mineRendered = mineStyle.getPropertyValue("content") !== "none";
-              const referenceRendered = referenceStyle.getPropertyValue("content") !== "none";
-              if (mineRendered !== referenceRendered) {
-                diffs.push(`${where}${pseudo}: ${mineRendered ? "rendered" : "not rendered"} vs ${referenceRendered ? "rendered" : "not rendered"}`);
-                continue;
-              }
-              if (mineRendered) compare(mineStyle, referenceStyle, pseudoProperties, `${where}${pseudo} `);
-            }
-          };
-          compare(getComputedStyle(first), getComputedStyle(other), properties, "");
-          comparePseudos(first, other, "");
-          const mineDescendants = Array.from(first.querySelectorAll("*"));
-          const referenceDescendants = Array.from(other.querySelectorAll("*"));
-          if (mineDescendants.length !== referenceDescendants.length) {
-            diffs.push(`descendant count: ${mineDescendants.length} vs ${referenceDescendants.length}`);
-          }
-          const pairCount = Math.min(mineDescendants.length, referenceDescendants.length, 12);
-          for (let position = 0; position < pairCount; position += 1) {
-            const mine = mineDescendants[position];
-            const reference = referenceDescendants[position];
-            if (!mine || !reference) break;
-            if (mine.tagName !== reference.tagName) {
-              diffs.push(`descendant ${position + 1}: <${mine.tagName.toLowerCase()}> vs <${reference.tagName.toLowerCase()}>`);
-              continue;
-            }
-            const where = `descendant ${position + 1} <${mine.tagName.toLowerCase()}>`;
-            compare(getComputedStyle(mine), getComputedStyle(reference), descendantProperties, `${where} `);
-            comparePseudos(mine, reference, where);
-          }
-          if (diffs.length === 0) {
-            return { pass: true, actual: "matches the reference on all design properties (element, descendants, ::before/::after)" };
-          }
-          const shown = diffs.slice(0, 12);
-          const suffix = diffs.length > shown.length ? `; …and ${diffs.length - shown.length} more` : "";
-          return { pass: false, actual: `diverges — ${shown.join("; ")}${suffix}` };
         }
         case "not-clipped": {
           if (!first) return { pass: false, actual: "no match" };
@@ -1838,25 +2397,28 @@ export const PROBE_TEMPLATES = {
   observe_network_bodies: observeNetworkBodiesProbe,
   click_element: clickElementProbe,
   assert_page_state: assertPageStateProbe,
+  locate_for_review: locateForReviewProbe,
 } satisfies Record<ProbeName, (params: never, helpers: ProbeHelpers) => ProbeResult | Promise<ProbeResult>>;
 
 /**
- * Execution world per probe. Everything runs in the sandboxed USER_SCRIPT
+ * Execution world per probe. Everything runs in the extension's ISOLATED
  * world EXCEPT read_page_state, whose whole purpose is the MAIN-world store —
- * that difference is why it carries the getter caveat above.
+ * that difference is why it carries the getter caveat above, and why the
+ * engine injects page-state.js before it (page-state-reader.ts).
  */
 export const PROBE_WORLDS = {
-  query_elements: "USER_SCRIPT",
-  search_elements: "USER_SCRIPT",
-  inspect_element: "USER_SCRIPT",
-  inspect_design: "USER_SCRIPT",
-  read_structured_data: "USER_SCRIPT",
+  query_elements: "ISOLATED",
+  search_elements: "ISOLATED",
+  inspect_element: "ISOLATED",
+  inspect_design: "ISOLATED",
+  read_structured_data: "ISOLATED",
   read_page_state: "MAIN",
-  list_network_resources: "USER_SCRIPT",
-  replay_network_resource: "USER_SCRIPT",
+  list_network_resources: "ISOLATED",
+  replay_network_resource: "ISOLATED",
   // The buffer lives in a MAIN-world closure, but CustomEvents cross worlds
-  // (the relay's own pattern), so the read runs sandboxed like the rest.
-  observe_network_bodies: "USER_SCRIPT",
-  click_element: "USER_SCRIPT",
-  assert_page_state: "USER_SCRIPT",
-} satisfies Record<ProbeName, "USER_SCRIPT" | "MAIN">;
+  // (the relay's own pattern), so the read runs isolated like the rest.
+  observe_network_bodies: "ISOLATED",
+  click_element: "ISOLATED",
+  assert_page_state: "ISOLATED",
+  locate_for_review: "ISOLATED",
+} satisfies Record<ProbeName, "ISOLATED" | "MAIN">;

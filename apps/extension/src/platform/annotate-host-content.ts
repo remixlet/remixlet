@@ -4,8 +4,8 @@
 // target tab's ISOLATED world when the user clicks the panel's pencil button,
 // then sends ANNOTATE_OPEN_MESSAGE.
 //
-// The overlay is a closed-shadow-root shell (same hardening pattern as
-// drawer-host-content.ts). The flow is selection-first, two steps:
+// The overlay is a closed-shadow-root shell, so the page can neither inspect
+// nor restyle it. The flow is selection-first, two steps:
 //   1. Select an area — drag a freehand box, or click a snap-highlighted
 //      element (hovering outlines the smallest annotatable element).
 //   2. Act on it — an action popover on the fresh mark offers "Add note"
@@ -17,8 +17,8 @@
 // Every selection and arrow endpoint is resolved against the live DOM at
 // creation time (platform/annotate-resolve.ts) into selectors and insertion
 // anchors. On Done the payload broadcasts as an ANNOTATION_RESULT_KIND
-// runtime message — the panel attaches it to the next prompt, the worker
-// restores the drawer it hid — and the overlay stays in a passive state
+// runtime message — the panel attaches it to the next prompt — and the
+// overlay stays in a passive state
 // (marks visible, an idle "Annotate this page" pill for re-entry) until the
 // panel consumes or discards the attachment (ANNOTATE_CLEAR_MESSAGE).
 
@@ -55,7 +55,6 @@ import {
 } from "./overlay-theme.js";
 
 const ANNOTATE_HOST_ID = "remixlet-extension-annotate";
-const DRAWER_HOST_ID = "remixlet-extension-drawer";
 /** Releases that moved less than this (px) count as a click, not a drag. */
 const CLICK_MAX_PX = 6;
 /** Dragged boxes must exceed this (px) on both axes to commit. */
@@ -143,7 +142,7 @@ function installAnnotateHost(): AnnotateHostState {
   let lastPointer: { x: number; y: number } | undefined;
   let markSerial = 0;
 
-  const resolver = createAnnotationResolver([ANNOTATE_HOST_ID, DRAWER_HOST_ID]);
+  const resolver = createAnnotationResolver([ANNOTATE_HOST_ID]);
 
   // ---- shell ---------------------------------------------------------------
 

@@ -180,6 +180,7 @@ function ProviderRow({
                 <Input
                   id={`provider-url-${provider.id}`}
                   value={baseUrl}
+                  readOnly={provider.kind === "codex"}
                   onChange={(event) => setBaseUrl(event.target.value)}
                 />
               </Field>

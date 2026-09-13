@@ -7,7 +7,8 @@
 //   storage.local  codexAuth            refresh_token, id_token, account — the
 //                                       durable grant (not encrypted at rest;
 //                                       same posture as ~/.codex/auth.json)
-//   storage.local  codexIssuerOverride  test hook: point the issuer at a mock
+//   storage.local  (dev builds only)    test hook that points the issuer at a
+//                                       mock; see codex-issuer-override.ts
 //   storage.local  codexDnrMissCount    telemetry: fallback fired for real
 //   storage.session codexAccess         access_token + expiry (memory-only)
 //   storage.session codexPendingFlow    PKCE verifier + state while a consent
@@ -16,6 +17,7 @@
 import { removeSessionRule, setSessionRedirectRule, useDnrOAuthRedirect } from "../platform/dnr.js";
 import { detectCapabilities } from "../platform/capabilities.js";
 import { ext } from "../platform/ext.js";
+import { testIssuerOverride } from "./codex-issuer-override.js";
 import {
   accessTokenExpiry,
   accountFromIdToken,
@@ -34,7 +36,6 @@ import {
 const AUTH_KEY = "codexAuth";
 const ACCESS_KEY = "codexAccess";
 const PENDING_KEY = "codexPendingFlow";
-const ISSUER_OVERRIDE_KEY = "codexIssuerOverride";
 const DNR_MISS_KEY = "codexDnrMissCount";
 
 /** Reserved session-rule id — remixlet-owned DNR ranges (M4) must avoid it. */
@@ -73,7 +74,7 @@ async function sessionGet<T>(key: string): Promise<T | undefined> {
 }
 
 async function issuer(): Promise<string> {
-  return (await localGet<string>(ISSUER_OVERRIDE_KEY)) ?? CODEX_ISSUER;
+  return (await testIssuerOverride()) ?? CODEX_ISSUER;
 }
 
 // ---- flow lifecycle ---------------------------------------------------------

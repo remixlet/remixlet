@@ -3,7 +3,7 @@
 // blowing the context window; every cap is announced in the text so the
 // model knows what it is not seeing.
 
-import type { CaptureBundle } from "./capture.js";
+import type { CaptureBundle, NetworkCensus } from "./capture.js";
 
 export interface FormatCaps {
   /** Max DOM characters included. */
@@ -16,8 +16,6 @@ export interface FormatCaps {
   consoleEntries: number;
   /** Max frame-inventory entries listed. */
   frameEntries: number;
-  /** Max data-request host tallies listed. */
-  dataRequestHosts: number;
 }
 
 export const DEFAULT_FORMAT_CAPS: FormatCaps = {
@@ -26,7 +24,6 @@ export const DEFAULT_FORMAT_CAPS: FormatCaps = {
   bodyChars: 2000,
   consoleEntries: 40,
   frameEntries: 20,
-  dataRequestHosts: 12,
 };
 
 export function formatCaptureForModel(bundle: CaptureBundle, caps: FormatCaps = DEFAULT_FORMAT_CAPS): string {
@@ -55,22 +52,11 @@ export function formatCaptureForModel(bundle: CaptureBundle, caps: FormatCaps = 
     }
   }
 
-  // Unlike frames, an EMPTY tally still renders: "this page has fetched no
-  // data yet" redirects discovery toward embedded state, so the fact earns
-  // its line. Absent field = not collected (the missing[] note says so).
-  if (bundle.dataRequests) {
-    const shown = bundle.dataRequests.slice(0, caps.dataRequestHosts);
-    parts.push(
-      "",
-      `## Data requests (per-host fetch/XHR tallies — URLs and bodies not included${overflow(bundle.dataRequests.length, caps.dataRequestHosts)})`,
-    );
-    if (bundle.dataRequests.length === 0) {
-      parts.push("- (none recorded — the page has made no fetch/XHR data requests yet)");
-    }
-    for (const row of shown) {
-      parts.push(`- ${row.host} — ${row.count} request(s)${row.jsonCount > 0 ? `, ${row.jsonCount} JSON` : ""}`);
-    }
-  }
+  // The network census (wiki/design/network-probes.md). Unlike frames, an
+  // EMPTY census still renders: "this page has fetched no data yet" redirects
+  // discovery toward embedded state, so the fact earns its line. Absent
+  // field = not collected (the missing[] note says so).
+  if (bundle.networkCensus) parts.push("", ...formatNetworkCensus(bundle.networkCensus));
 
   if (bundle.network) {
     const shown = bundle.network.slice(0, caps.networkEntries);
@@ -109,4 +95,45 @@ export function formatCaptureForModel(bundle: CaptureBundle, caps: FormatCaps = 
 
 function overflow(total: number, cap: number): string {
   return total > cap ? `, showing ${cap}` : "";
+}
+
+/** Bytes as the model reads them: KB with one decimal above a kilobyte, plain bytes below. */
+export function formatByteSize(bytes: number): string {
+  if (bytes >= 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+  if (bytes >= 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  return `${bytes} B`;
+}
+
+/**
+ * The Data endpoints section: one line per endpoint group, id first, host
+ * and path shape, calls, size, content type and statuses. The rows arrive
+ * already cut to the largest (shared/capture.ts NETWORK_CENSUS_MAX_ENDPOINTS);
+ * the rest are counted with the way to reach them.
+ */
+export function formatNetworkCensus(census: NetworkCensus): string[] {
+  const lines = [
+    `## Data endpoints (${census.endpointTotal} endpoint group(s), ${census.requestTotal} data request(s) this page load; ` +
+      "fetch/XHR and JSON/XML responses, no URLs or bodies; replay an id with replay_network_resource)",
+  ];
+  if (census.endpoints.length === 0) {
+    lines.push("- (none recorded: the page has made no fetch/XHR data requests yet)");
+  }
+  for (const row of census.endpoints) {
+    const size =
+      row.bytes === null ? "size hidden" : `${formatByteSize(row.bytes)}${row.sizeSource === "transfer" ? " on the wire" : ""}`;
+    const type = row.contentType === null ? "" : ` ${row.contentType.split(";")[0]?.trim() ?? row.contentType}`;
+    const statuses = row.statuses.length > 0 ? ` ${row.statuses.join("/")}` : "";
+    const site = row.sameSite ? "" : " (other site)";
+    lines.push(`- ${row.id} ${row.host} ${row.path} | ${row.count} call(s), ${size}${type}${statuses}${site}`);
+  }
+  const rest = census.endpointTotal - census.endpoints.length;
+  if (rest > 0) {
+    lines.push(
+      `- ${rest} more, smaller (list_network_resources: urlFilter narrows by host or path, search finds which response carries a value)`,
+    );
+  }
+  if (census.bufferPossiblySaturated) {
+    lines.push("- (the browser's resource-timing buffer is full, so requests made after it filled are missing from this list)");
+  }
+  return lines;
 }

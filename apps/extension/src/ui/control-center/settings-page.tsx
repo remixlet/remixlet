@@ -8,11 +8,12 @@
 // general tab is open.
 //
 // Preference changes apply live everywhere: pages re-theme through
-// followThemePreference()'s storage listener, and the panel rebuilds its
-// runtime on the next turn when the verbosity changes.
+// followThemePreference()'s storage listener, the panel rebuilds its
+// runtime on the next turn when the verbosity changes, and the permission
+// alert switch is read at the next ask (panel/ask-notifications.ts).
 
 import { useEffect, useState } from "react";
-import { Loader2, Monitor, Moon, Sun, type LucideIcon } from "lucide-react";
+import { Bell, BellOff, Loader2, Monitor, Moon, Sun, type LucideIcon } from "lucide-react";
 
 import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { cn } from "@/lib/utils";
@@ -40,6 +41,11 @@ const VERBOSITY_CHOICES: Choice<ChatVerbosity>[] = [
   { value: "quiet", label: "Quiet", detail: "Questions and results only." },
   { value: "standard", label: "Standard", detail: "A short line about each step as it works." },
   { value: "detailed", label: "Detailed", detail: "Standard, plus the model's own working notes." },
+];
+
+const ASK_NOTIFICATION_CHOICES: Choice<"on" | "off">[] = [
+  { value: "on", label: "On", detail: "A notification when the chat is waiting for your answer and is not in view.", icon: Bell },
+  { value: "off", label: "Off", detail: "No notifications. The chat waits without alerting you.", icon: BellOff },
 ];
 
 const SECTION_TABS: { section: SettingsSection; label: string }[] = [
@@ -160,6 +166,18 @@ function GeneralSection() {
             choices={VERBOSITY_CHOICES}
             value={preferences.verbosity}
             onChange={(verbosity) => save({ ...preferences, verbosity })}
+          />
+        </SettingRow>
+        <SettingRow
+          id="setting-ask-notifications"
+          title="Permission alerts"
+          detail="A system notification when the assistant needs you to allow something and the chat is out of view. If they do not appear, please check your operating system allows notifications from your browser."
+        >
+          <SegmentedChoice
+            legend="Permission alerts"
+            choices={ASK_NOTIFICATION_CHOICES}
+            value={preferences.askNotifications ? "on" : "off"}
+            onChange={(choice) => save({ ...preferences, askNotifications: choice === "on" })}
           />
         </SettingRow>
       </section>

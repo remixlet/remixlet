@@ -1,6 +1,7 @@
-// Worker half of the rmx.* capability bridge: authentication, durable grant
-// enforcement, storage backing, and dispatch into privileged platform
-// services (wiki/handoff.md §5). rmx.storage semantics: namespaced per remixlet,
+// Worker half of the rmx.* capability bridge: authentication, capability
+// enforcement (against the stored manifest, the approval record — see
+// hasCapabilityGrant in activation.ts), storage backing, and dispatch into
+// privileged platform services (wiki/handoff.md §5). rmx.storage semantics: namespaced per remixlet,
 // shared across ALL of that remixlet's matched hosts, invisible to pages,
 // survives sites clearing their own storage. Backing: one
 // chrome.storage.local key per remixlet holding { rev, data }.
@@ -10,10 +11,11 @@ import { writeClipboardText } from "../platform/clipboard.js";
 import { clearOwnedNotification, createOwnedNotification } from "../platform/notifications.js";
 import { privilegedFetch, type PrivilegedFetchRequest, type PrivilegedFetchResult } from "../platform/privileged-fetch.js";
 import { fetchHostPattern, urlMatchesFetchHostPattern } from "../shared/fetch-capability.js";
-import { bridgeGateReason } from "./bridge-gate.js";
+import { pageIneligibleReason } from "../shared/eligibility.js";
 import { SCRIPT_LOG_MAX_MESSAGE_LENGTH } from "./script-log.js";
 import { hasCapabilityGrant } from "./activation.js";
-import { readMirror } from "./injection.js";
+import { readDeletingMarks } from "./eligibility.js";
+import { authenticatedRemixlet, readMirror } from "./injection.js";
 import { readPausedSites } from "./site-pause.js";
 import { handleMenuBridgeMessage, type MenuBridgeMessage } from "./menu.js";
 import { appendScriptLog } from "./script-log.js";
@@ -89,7 +91,7 @@ type BridgeMessage =
   | RunBridgeMessage
   | MenuBridgeMessage;
 
-type BridgeReply =
+export type BridgeReply =
   | {
       ok: true;
       value?: unknown;
@@ -156,7 +158,7 @@ async function bridgeActiveGate(
   remixlet: { id: string; matches: string[] },
   senderUrl: string | undefined,
 ): Promise<string | undefined> {
-  return bridgeGateReason(remixlet.id, remixlet.matches, senderUrl, await readPausedSites());
+  return pageIneligibleReason(remixlet, senderUrl, await readPausedSites());
 }
 
 export async function handleBridgeMessage(
@@ -165,10 +167,8 @@ export async function handleBridgeMessage(
 ): Promise<BridgeReply> {
   const senderUrl = sender?.url ?? sender?.tab?.url;
   try {
-    const remixlet = (await readMirror()).find((candidate) => candidate.id === message.remixletId);
-    if (!remixlet || remixlet.bridgeToken !== message.bridgeToken) {
-      return { ok: false, error: "unauthenticated remixlet bridge caller" };
-    }
+    const remixlet = await authenticatedRemixlet(message.remixletId, message.bridgeToken);
+    if (!remixlet) return { ok: false, error: "unauthenticated remixlet bridge caller" };
     if (message.kind === "rmx.log") {
       // Telemetry, not authority: no capability required. Bounded per-remixlet
       // ring; the panel's read_remixlet_logs tool reads it back for the agent.
@@ -388,14 +388,40 @@ async function hasStorageGrant(remixletId: string): Promise<boolean> {
 
 const storeKey = (remixletId: string) => `rmxstore:${remixletId}`;
 
+// Every write to an rmxstore key goes through this lane, and so does
+// delete-forever's removal of the key (clearRemixletStorage). The lane is what
+// makes "an in-flight rmx.storage write does not recreate the key" true: a
+// write queued before the removal lands first and is erased by it; one queued
+// after it re-checks, behind the lane, that the remixlet is neither marked
+// deleting nor gone from the mirror, and refuses. In-flight-only state.
+let storageLane: Promise<unknown> = Promise.resolve();
+
+function inStorageLane<T>(operation: () => Promise<T>): Promise<T> {
+  const run = storageLane.then(operation, operation);
+  storageLane = run.catch(() => undefined);
+  return run;
+}
+
 async function readStore(remixletId: string): Promise<RemixletStorageRecord> {
   const stored = await ext.storage.local.get(storeKey(remixletId));
   return parseStorageRecord(stored[storeKey(remixletId)]);
 }
 
 async function writeStore(remixletId: string, store: RemixletStorageRecord): Promise<void> {
-  store.rev += 1;
-  await ext.storage.local.set({ [storeKey(remixletId)]: store });
+  await inStorageLane(async () => {
+    if ((await readDeletingMarks()).has(remixletId) || !(await readMirror()).some((r) => r.id === remixletId)) {
+      throw new Error(`remixlet "${remixletId}" storage is no longer available`);
+    }
+    store.rev += 1;
+    await ext.storage.local.set({ [storeKey(remixletId)]: store });
+  });
+  for (const wake of waiters.get(remixletId) ?? []) wake();
+  waiters.delete(remixletId);
+}
+
+/** Delete-forever's storage step: the remixlet's rmx.storage record, gone for good. */
+export async function clearRemixletStorage(remixletId: string): Promise<void> {
+  await inStorageLane(() => ext.storage.local.remove(storeKey(remixletId)));
   for (const wake of waiters.get(remixletId) ?? []) wake();
   waiters.delete(remixletId);
 }

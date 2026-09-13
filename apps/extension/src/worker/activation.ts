@@ -1,5 +1,5 @@
 // Atomic activation pipeline (wiki/handoff.md §5): commit to git → rebuild mirror →
-// re-register user scripts → reload the affected tab ONCE. All-or-nothing:
+// reconcile the content-script registrations → reload the affected tab ONCE. All-or-nothing:
 // any failure rolls the mirror (and registrations) back to the previous state
 // and reports. Restart-free activation is a core product promise — any
 // "reload the browser" path is a bug.
@@ -8,15 +8,23 @@
 // the mirror on every navigation (css.ts) — the one tab reload re-applies it.
 // DNR refresh joins the pipeline at M4.
 
-import { isSupportedScriptFile, MANIFEST_FILE } from "../shared/remixlet.js";
+import { isSupportedScriptFile, MANIFEST_FILE, stampManifestBuiltWith } from "../shared/remixlet.js";
 import { parseRemixletManifest, parseStoredRemixletManifest, validateManifestFileReferences } from "../shared/remixlet.js";
 import type { RemixletManifest } from "../shared/remixlet.js";
-import { remixletCapabilityDisabledReason } from "../platform/capabilities.js";
+import { detectCapabilities, remixletCapabilityDisabledReason } from "../platform/capabilities.js";
 import { getDynamicRules, replaceDynamicRules } from "../platform/dnr.js";
 import { ext } from "../platform/ext.js";
-import { scriptInjector } from "../platform/script-injector.js";
 import { clearOwnedNotifications } from "../platform/notifications.js";
-import { matchesCoverAllSites, matchesWiden, siteKeyForMatches, siteKeysPausing, urlMatchesAny, urlWithinSiteKey } from "../shared/site-key.js";
+import {
+  matchesCoverAllSites,
+  matchesSpanningPublicSuffix,
+  matchesWiden,
+  matchesWithinSite,
+  siteKeyForMatches,
+  siteKeysPausing,
+  urlMatchesAny,
+  urlWithinSiteKey,
+} from "../shared/site-key.js";
 import {
   archivedIdCollisionMessage,
   RemixletStore,
@@ -24,11 +32,31 @@ import {
   type RegistryEntry,
 } from "../store/remixlet-store.js";
 import { refreshAllBadges } from "./badge.js";
+import { settleTab, waitForBoxRun } from "./box.js";
+import { runsOn } from "../shared/eligibility.js";
 import { observeHostPattern } from "../shared/observe-capability.js";
-import { bridgeTokenFor, readMirror, reconcileUserScripts, relayTokenFor, writeMirror, type ActiveRemixlet } from "./injection.js";
-import { reconcileNetRules, validateNetRulesFile } from "./netrules.js";
+import { clearRemixletStorage } from "./bridge.js";
+import { testDeletionFault } from "./deletion-fault.js";
+import {
+  clearDeletingMark,
+  judgeArtifact,
+  markDeleting,
+  quarantineAdvice,
+  readDeletingMarks,
+  readQuarantine,
+  writeQuarantine,
+  type QuarantineRecord,
+} from "./eligibility.js";
+import {
+  bridgeTokenFor,
+  clearTokens,
+  readMirror,
+  reconcileRegistrations,
+  writeMirror,
+  type ActiveRemixlet,
+} from "./injection.js";
+import { reconcileNetRules, releaseNetRuleAllocation, validateNetRulesFile } from "./netrules.js";
 import { readPausedSites, setSitePaused, writePausedSites } from "./site-pause.js";
-import { bridgeSkewReason } from "../shared/bridge-version.js";
 import { appendScriptLogOnce, clearScriptLog } from "./script-log.js";
 import { clearUsage } from "./usage.js";
 import { invalidateCaptureDigestForTab, invalidateCaptureDigestForUrl } from "./capture-freshness.js";
@@ -42,16 +70,56 @@ import {
   restoreScheduleState,
   type ScheduleState,
 } from "./schedule.js";
-import { CapabilityGrantStore, type CapabilityGrants } from "./capability-grants.js";
 
 export type ActivationOutcome =
-  | { ok: true; entry: RegistryEntry; jsChanged: boolean }
+  | {
+      ok: true;
+      entry: RegistryEntry;
+      jsChanged: boolean;
+      /**
+       * Set when the bound tab was not reloaded because it no longer shows the
+       * authorized site (closed, off the web, or on another site): the
+       * remixlet is stored and runs on its site from the next load, and the
+       * page in that tab is not the one to verify against. Model-readable.
+       */
+      reloadSkipped?: string;
+    }
   | { ok: false; reason: "failed"; message: string; rolledBack: boolean }
   | { ok: false; reason: "needs-capability-approval"; message: string; rolledBack: false; proposal: CapabilityApprovalProposal };
 
 export type RollbackOutcome =
   | { ok: true; entry: RegistryEntry }
   | { ok: false; reason: "needs-capability-approval"; proposal: CapabilityApprovalProposal };
+
+/**
+ * The page a conversation is authorized to act on. The PANEL captures it from
+ * its tab binding (tab-binding.ts) and sends it with every agent-originated
+ * activation; the model never authors it (wiki/ops/2026-09-04-security-remediation-plan.md
+ * item 7). The worker rejects a manifest whose `matches` leave that site
+ * without approval. A request with no authorization (nothing binds it to a
+ * page: a future import) gets no silent path at all — its scope always goes
+ * through the dialog.
+ *
+ * If the bound tab has MOVED TO ANOTHER SITE by activation time, the write is
+ * refused before anything is stored (maintainer decision, 2026-09-04,
+ * reversing the same day's earlier decision to install anyway): the page the
+ * user was looking at when they asked is gone, so the request the install
+ * answers can no longer be checked against anything, and the same rule that
+ * refuses reads on a moved tab should not quietly exempt writes. A tab that is
+ * merely CLOSED is not that case — nothing moved out from under anyone — and
+ * still installs with the reload skipped.
+ */
+/** Why the bound tab is no longer the authorized page. `off-site` refuses the write; `closed` only skips the reload. */
+interface SiteAuthorizationDrift {
+  kind: "closed" | "off-site";
+  message: string;
+}
+
+export interface SiteAuthorization {
+  /** siteKeyForUrl of the bound tab at bind time — the site term. */
+  siteKey: string;
+  tabId: number;
+}
 
 export interface CapabilityApprovalProposal {
   proposalId: string;
@@ -60,9 +128,10 @@ export interface CapabilityApprovalProposal {
   requested: string[];
   added: string[];
   /**
-   * Previously granted capabilities this activation drops (the grant record is
-   * rewritten to exactly `requested`). Shown wherever the proposal is put to a
-   * human, so a capability swap reads as a replacement, not extra access.
+   * Previously approved capabilities this activation drops (the stored
+   * manifest is the approval record, and this activation replaces it with
+   * exactly `requested`). Shown wherever the proposal is put to a human, so a
+   * capability swap reads as a replacement, not extra access.
    */
   removed: string[];
   rationales: Record<string, string>;
@@ -82,6 +151,12 @@ export interface CapabilityApprovalProposal {
    */
   broadScope: boolean;
   /**
+   * The scope is every site, or every site under a shared domain — the
+   * strongest form of `broadScope`, split out so the dialog can ask the exact
+   * question ("Run on every site?" versus "Run on more sites?").
+   */
+  coversAllSites: boolean;
+  /**
    * A remixlet that already holds `netrules` is changing the CONTENT of its
    * rules file versus what was approved (H5). Capability names did not change,
    * so nothing else here would raise a dialog — this flag forces one, and the
@@ -89,49 +164,30 @@ export interface CapabilityApprovalProposal {
    * one-click auto-approval, so a rules rewrite is never bypassed.
    */
   netRulesChanged: boolean;
+  /**
+   * The manifest's `matches` reach outside the site the conversation is
+   * authorized to act on (`authorizedSite`), or the request carried no site
+   * authorization at all (`authorizedSite` undefined). Either way the scope
+   * must be SHOWN: a fresh install aimed at a site the user is not on, a
+   * mixed `[this site, another site]` install and a same-scope rewrite of an
+   * off-site artifact all land here, and the panel's one-click auto-approval
+   * never covers it.
+   */
+  offSite: boolean;
+  authorizedSite: string | undefined;
 }
 
 interface StoredCapabilityProposal extends CapabilityApprovalProposal {
   createdAt: number;
   artifactDigest: string;
+  /** The context that raised the proposal; approval must arrive from the same one. */
+  authorization: SiteAuthorization | undefined;
 }
 
-const CAPABILITY_GRANTS_KEY = "remixletCapabilityGrants";
-// Sentinel: set the first time the legacy manifest→grants migration runs, so a
-// later missing grants key is read as a cleared record (fail closed) rather
-// than a fresh legacy install to re-derive from (capability-grants.ts).
-const CAPABILITY_GRANTS_MIGRATED_KEY = "remixletCapabilityGrantsMigrated";
 const CAPABILITY_PROPOSALS_KEY = "remixletCapabilityProposals";
-// Digest of the netRules file content the user last approved, per remixlet.
-// Argument-free `netrules` grants would otherwise let v2 rewrite rules.json
-// with no dialog (H5); binding the content here makes a change re-prompt.
-const NET_RULES_DIGESTS_KEY = "remixletNetRulesDigests";
 const PROPOSAL_MAX_AGE_MS = 10 * 60 * 1000;
-type NetRulesDigests = Record<string, string>;
 
 const store = new RemixletStore();
-const capabilityGrantStore = new CapabilityGrantStore(
-  async () => {
-    const stored = await ext.storage.local.get(CAPABILITY_GRANTS_KEY);
-    // SAFETY: CapabilityGrantStore is the sole writer for this persisted grants key.
-    return stored[CAPABILITY_GRANTS_KEY] as CapabilityGrants | undefined;
-  },
-  async (grants) => {
-    await ext.storage.local.set({ [CAPABILITY_GRANTS_KEY]: grants });
-  },
-  async () => {
-    const migrated: CapabilityGrants = {};
-    for (const entry of await store.list()) {
-      const { manifest } = await store.read(entry.id);
-      migrated[entry.id] = normalizedCapabilities(manifest.capabilities);
-    }
-    return migrated;
-  },
-  async () => (await ext.storage.local.get(CAPABILITY_GRANTS_MIGRATED_KEY))[CAPABILITY_GRANTS_MIGRATED_KEY] === true,
-  async () => {
-    await ext.storage.local.set({ [CAPABILITY_GRANTS_MIGRATED_KEY]: true });
-  },
-);
 let activationMutationTail: Promise<void> = Promise.resolve();
 
 function enqueueActivationMutation<T>(operation: () => Promise<T>): Promise<T> {
@@ -153,16 +209,35 @@ export async function activateRemixlet(
   reloadTabId?: number,
   capabilityApproval?: { proposalId: string },
   message?: string,
+  authorization?: SiteAuthorization,
 ): Promise<ActivationOutcome> {
-  return enqueueActivationMutation(() => activateRemixletUnlocked(files, reloadTabId, capabilityApproval, message));
+  return enqueueActivationMutation(() =>
+    activateRemixletUnlocked(files, reloadTabId, capabilityApproval, message, validSiteAuthorization(authorization)),
+  );
 }
 
 async function activateRemixletUnlocked(
-  files: Record<string, string>,
-  reloadTabId?: number,
-  capabilityApproval?: { proposalId: string },
-  message?: string,
+  submitted: Record<string, string>,
+  reloadTabId: number | undefined,
+  capabilityApproval: { proposalId: string } | undefined,
+  message: string | undefined,
+  authorization: SiteAuthorization | undefined,
 ): Promise<ActivationOutcome> {
+  // The bridge stamp is applied HERE, at the store's only write path, so no
+  // caller (the panel's write tool, a harness suite, a future import) can
+  // store an artifact without it. The panel stamps too, before formatting;
+  // re-stamping the same value is idempotent.
+  const files: Record<string, string> =
+    submitted[MANIFEST_FILE] === undefined
+      ? submitted
+      : { ...submitted, [MANIFEST_FILE]: stampManifestBuiltWith(submitted[MANIFEST_FILE], ext.runtime.getManifest().version) };
+  // Before the manifest is even parsed, and long before anything is stored:
+  // a bound tab that moved to another site refuses the write outright. Read
+  // from the live tab, never from what the panel or the model reports.
+  const drift = authorization ? await siteAuthorizationDrift(authorization) : undefined;
+  if (drift?.kind === "off-site") {
+    return { ok: false, reason: "failed", message: `not activated: ${drift.message}`, rolledBack: false };
+  }
   let manifest;
   try {
     manifest = parseRemixletManifest(files[MANIFEST_FILE] ?? "");
@@ -171,22 +246,6 @@ async function activateRemixletUnlocked(
   } catch (error) {
     return { ok: false, reason: "failed", message: `not activated: ${String(error)}`, rolledBack: false };
   }
-  // Verified with a real call, not just the namespace: this worker context
-  // keeps chrome.userScripts after the browser revokes the lane, and
-  // registering scripts that can never run is worse than refusing here
-  // (script-injector.ts). Unconditional, because the sync capability checks
-  // further down — page-world, network:observe — ride the same lane and read
-  // the verdict this call settles.
-  const scriptLane = await scriptInjector().verifyAvailable();
-  if ((manifest.scripts?.length ?? 0) > 0 && !scriptLane) {
-    return {
-      ok: false,
-      reason: "failed",
-      message: `not activated: ${scriptInjector().disabledReason}`,
-      rolledBack: false,
-    };
-  }
-
   // Id collisions with archived remixlets fail before the capability flow, so
   // the user is never asked to approve a doomed activation. The store's
   // activate() guard enforces the same rule; this is the courteous early exit.
@@ -194,8 +253,6 @@ async function activateRemixletUnlocked(
   if (previousEntry?.state === "archived") {
     return { ok: false, reason: "failed", message: `not activated: ${archivedIdCollisionMessage(manifest.id)}`, rolledBack: false };
   }
-
-  const grants = await readCapabilityGrants();
   const requested = normalizedCapabilities(manifest.capabilities);
   const unsupported = requested
     .map((capability) => ({ capability, reason: remixletCapabilityDisabledReason(capability) }))
@@ -208,8 +265,20 @@ async function activateRemixletUnlocked(
       rolledBack: false,
     };
   }
-  const previousGrants = grants[manifest.id] ?? [];
-  const added = requested.filter((capability) => !previousGrants.includes(capability));
+  // Scripts run only in the box; a browser that cannot host one (Firefox,
+  // Safari: platform/capabilities.ts) gets the reason here rather than a
+  // stored remixlet that never runs.
+  const boxReason = (manifest.scripts ?? []).length > 0 ? detectCapabilities().disabledReasons.box : undefined;
+  if (boxReason !== undefined) {
+    return { ok: false, reason: "failed", message: `not activated: ${boxReason}`, rolledBack: false };
+  }
+  // The previous STORED version is the approval record: this write gate is the
+  // only path into the store, so a stored manifest only ever names capabilities
+  // the user approved. An unreadable previous version proves nothing — treat it
+  // as no approvals, so everything re-prompts (fail closed).
+  const previousVersion = previousEntry ? await store.read(manifest.id).catch(() => undefined) : undefined;
+  const previousApproved = previousVersion ? normalizedCapabilities(previousVersion.manifest.capabilities) : [];
+  const added = requested.filter((capability) => !previousApproved.includes(capability));
   // Scope is a gated power in its own right, not just capabilities (C1/Chain A).
   // Raise the approval surface when the code's reach GROWS versus the version
   // already live, and unconditionally whenever the manifest runs on every site
@@ -217,64 +286,73 @@ async function activateRemixletUnlocked(
   // but is exactly the silent-implant case.
   const scopeWidened = previousEntry !== undefined && matchesWiden(previousEntry.matches, manifest.matches);
   const coversAllSites = matchesCoverAllSites(manifest.matches);
-  const broadScope = scopeWidened || coversAllSites;
-  // A rewrite of already-granted network rules must re-prompt too (H5): the
+  // A wildcard over a public suffix (`*.appspot.com`) is refused at the write
+  // gate for new manifests, but a stored artifact that predates the full list
+  // (item 8) still parses; when one comes back through here, the scope is put
+  // to the user as broad, never folded into the one-click auto-approval.
+  const spansSuffix = matchesSpanningPublicSuffix(manifest.matches).length > 0;
+  const broadScope = scopeWidened || coversAllSites || spansSuffix;
+  // A rewrite of already-approved network rules must re-prompt too (H5): the
   // capability name is unchanged, so nothing above would raise a dialog.
-  const netRulesChanged = await netRulesContentChanged(manifest, files, previousGrants, requested);
-  if (added.length > 0 || broadScope || netRulesChanged) {
+  const netRulesChanged = netRulesContentChanged(manifest, files, previousVersion, previousApproved, requested);
+  // The site term: every match pattern must fit inside the site the
+  // conversation is bound to. This is what the three checks above cannot see
+  // — a first install aimed at a site the user is not on has nothing to widen
+  // from and names no capability, and a same-scope rewrite of an installed
+  // off-site artifact changes nothing they compare. The stored version's
+  // matches are NOT consent for this conversation to write it: the site term
+  // is measured against the initiating context, every time. No binding at
+  // all means no silent path.
+  const offSite = authorization === undefined || !matchesWithinSite(manifest.matches, authorization.siteKey);
+  if (added.length > 0 || broadScope || netRulesChanged || offSite) {
     if (
       !capabilityApproval ||
-      !(await consumeMatchingProposal(capabilityApproval.proposalId, manifest.id, requested, files))
+      !(await consumeMatchingProposal(capabilityApproval.proposalId, manifest.id, requested, files, authorization))
     ) {
       const proposal = await createCapabilityProposal(
         manifest.id,
         manifest.name,
         requested,
         added,
-        previousGrants.filter((capability) => !requested.includes(capability)),
+        previousApproved.filter((capability) => !requested.includes(capability)),
         manifest.capabilityRationales ?? {},
         files,
         manifest.matches,
         broadScope,
+        coversAllSites || spansSuffix,
         netRulesChanged,
+        offSite,
+        authorization,
       );
       return {
         ok: false,
         reason: "needs-capability-approval",
-        message: approvalRequiredMessage(added, scopeWidened, coversAllSites, netRulesChanged),
+        message: approvalRequiredMessage(added, scopeWidened, coversAllSites, spansSuffix, netRulesChanged, offSite),
         rolledBack: false,
         proposal,
       };
     }
   }
 
-  const previousLive = await captureLiveState(grants);
-  // Decided BEFORE store.activate() overwrites the stored version — at this
-  // point store.read still returns the previous file set. A CSS-only diff owes
-  // the agent no click-cycle re-verification (contracts.ts gates on this), and
-  // only the store can answer "did any .js file actually change". Incoming
-  // files were Prettier-formatted panel-side exactly as the previous version
-  // was at its own write time, so the byte-compare is apples-to-apples. A
-  // fresh install counts as changed.
-  const jsChanged = previousEntry === undefined || (await jsFilesChanged(manifest.id, files));
+  const previousLive = await captureLiveState();
+  // Incoming files were Prettier-formatted panel-side exactly as the previous
+  // version was at its own write time, so the byte-compare is apples-to-apples.
+  // A CSS-only diff owes the agent no click-cycle re-verification (contracts.ts
+  // gates on this). A fresh install (or an unreadable previous version, which
+  // cannot prove the scripts are unchanged) counts as changed.
+  const jsChanged = previousVersion === undefined || jsFilesChanged(previousVersion.files, files);
   let entry: RegistryEntry;
   try {
     // 1. Snapshot first: even a failed activation leaves inspectable history
     // (its tag stays, so it remains a numbered, rollback-able version).
+    // This write is also the consent record: the gate above ensured every
+    // capability (and rules file) in `files` was just approved or already held.
     entry = await store.activate(files, message);
   } catch (error) {
     return { ok: false, reason: "failed", message: `not activated: ${String(error)}`, rolledBack: false };
   }
 
   try {
-    await writeCapabilityGrants({ ...grants, [manifest.id]: requested });
-    // Bind the approved rules content to the grant (H5): a later version that
-    // rewrites the file re-prompts. Cleared when the grant is dropped so a
-    // re-added netrules grant starts from a fresh approval.
-    await writeNetRulesDigest(
-      manifest.id,
-      requested.includes("netrules") ? await netRulesDigest(manifest, files) : undefined,
-    );
     if (previousEntry) await clearOwnedSchedules(manifest.id);
     // Stale script-log entries describe the replaced version, not this one.
     // Cleared BEFORE the mirror rebuild so notes the rebuild itself records
@@ -282,19 +360,29 @@ async function activateRemixletUnlocked(
     await clearScriptLog(manifest.id);
     await syncMirrorUnlocked();
     if (previousEntry) await clearMenuCommandsForRemixlet(manifest.id);
-    if (previousGrants.includes("notifications") && !requested.includes("notifications")) {
+    if (previousApproved.includes("notifications") && !requested.includes("notifications")) {
       await clearOwnedNotifications(manifest.id);
     }
-    if (reloadTabId !== undefined) {
+    // A tab that moved to another site never reached here (refused above).
+    // What remains is the closed tab, and one narrow race: a tab that moved
+    // between that check and this line. Neither withholds the install at this
+    // point — the artifact is already stored and runs only on its own site —
+    // but reloading a tab that now shows some other page would be a side
+    // effect on a page nobody pointed the agent at, so the reload is skipped
+    // and the outcome says so.
+    const reloadSkipped = (authorization ? await siteAuthorizationDrift(authorization) : undefined)?.message;
+    if (reloadTabId !== undefined && reloadSkipped === undefined) {
       // The reload applies the new version, so any capture digest for the
       // page is stale. Cleared BEFORE the reload (and before this returns),
       // so the contract's post-write capture can never be answered with an
       // unchanged-page short-circuit — even if the new page digests
       // identically (e.g. a CSS-only change the digest text cannot see).
       await invalidateCaptureDigestForTab(reloadTabId);
+      const reloadedAt = Date.now();
       await ext.tabs.reload(reloadTabId);
+      await awaitBoxRunAfterReload(manifest.id, reloadTabId, reloadedAt);
     }
-    return { ok: true, entry, jsChanged };
+    return reloadSkipped === undefined ? { ok: true, entry, jsChanged } : { ok: true, entry, jsChanged, reloadSkipped };
   } catch (error) {
     // Roll the live state back to the previous version. For an update the
     // history keeps the failed commit for inspection; a failed fresh install
@@ -311,76 +399,66 @@ export async function denyCapabilityProposal(proposalId: string): Promise<void> 
   return enqueueActivationMutation(() => denyCapabilityProposalUnlocked(proposalId));
 }
 
+/**
+ * Drop every pending proposal raised from `tabId` once that tab navigates to
+ * a page outside the site it was authorized for (remediation plan item 7,
+ * approval binding). The proposal asked for consent on behalf of a page the
+ * user was looking at; when the tab leaves the site that page is gone, so
+ * the consent has nothing left to attach to. A navigation within the site
+ * (a reload, an in-site link, a subdomain) keeps the proposals: the
+ * activation reload itself is one of those. The site test is the one the
+ * activation drift check applies: a non-web page or a host outside the site
+ * key is a move. Runs on the activation lane so it cannot interleave with a
+ * proposal being raised or consumed.
+ */
+export async function invalidateCapabilityProposalsForNavigation(tabId: number, url: string): Promise<void> {
+  return enqueueActivationMutation(async () => {
+    const proposals = await readCapabilityProposals();
+    let changed = false;
+    for (const [proposalId, proposal] of Object.entries(proposals)) {
+      const authorization = proposal.authorization;
+      if (authorization === undefined || authorization.tabId !== tabId) continue;
+      if (/^https?:/.test(url) && urlWithinSiteKey(url, authorization.siteKey)) continue;
+      delete proposals[proposalId];
+      changed = true;
+    }
+    if (changed) await ext.storage.session.set({ [CAPABILITY_PROPOSALS_KEY]: proposals });
+  });
+}
+
 async function denyCapabilityProposalUnlocked(proposalId: string): Promise<void> {
   const proposals = await readCapabilityProposals();
   delete proposals[proposalId];
   await ext.storage.session.set({ [CAPABILITY_PROPOSALS_KEY]: proposals });
 }
 
-/** Durable human grant check used by every privileged bridge service. */
+/**
+ * Approved-capability check used by every privileged bridge service. The
+ * stored manifest IS the consent record: activation is the only write path
+ * into the store, and it refuses any file set whose capabilities (or rules
+ * content) the user has not approved — so a capability a stored manifest
+ * names is one the user granted. Read from the committed snapshot at the
+ * registry head (store.read), never the worktree. An unreadable remixlet
+ * holds nothing.
+ */
 export async function hasCapabilityGrant(remixletId: string, capability: string): Promise<boolean> {
-  return (await readCapabilityGrants())[remixletId]?.includes(capability) ?? false;
-}
-
-/**
- * What a remixlet asks for versus what it currently holds — the manager's
- * capability panel. `declared` is the manifest's set (normalized/sorted);
- * `granted` is the durable grant record. A capability can be declared but not
- * granted (revoked, or never approved) — the panel shows that difference.
- */
-export async function readRemixletCapabilities(id: string): Promise<{ declared: string[]; granted: string[] }> {
-  const { manifest } = await store.read(id);
-  const granted = (await readCapabilityGrants())[id] ?? [];
-  return { declared: normalizedCapabilities(manifest.capabilities), granted: [...granted].sort() };
-}
-
-/**
- * Revoke one capability from a live remixlet without deleting it. The grant
- * record is the single source of truth every bridge service re-checks, so
- * dropping the name here is enough to deny future calls; syncMirror then tears
- * down the derived live resources (network:observe interceptors, DNR rules,
- * schedule ownership) and the reload scope evicts already-injected code.
- *
- * The code was written assuming the capability it just lost, so it is now
- * known broken: the remixlet is parked "needs-attention" (with the revoke
- * recorded as the cause) rather than left injecting. A chat brings it back —
- * a fixing write_remixlet either drops the capability or re-declares it,
- * which re-runs the approval flow. Returns the remaining granted set.
- */
-export async function revokeCapability(id: string, capability: string, scope: ReloadScope = {}): Promise<string[]> {
-  return enqueueActivationMutation(() => revokeCapabilityUnlocked(id, capability, scope));
-}
-
-async function revokeCapabilityUnlocked(id: string, capability: string, scope: ReloadScope): Promise<string[]> {
-  const entry = (await store.list()).find((candidate) => candidate.id === id);
-  if (!entry) throw new Error(`unknown remixlet: ${id}`);
-  const grants = await readCapabilityGrants();
-  const current = grants[id] ?? [];
-  if (!current.includes(capability)) return [...current].sort();
-  const next = current.filter((name) => name !== capability);
-  const live = await captureLiveState(grants);
   try {
-    await writeCapabilityGrants({ ...grants, [id]: next });
-    // Park before the mirror rebuild so the rebuild already sees the entry as
-    // not-enabled and drops it from injection. Archived entries are already
-    // inert and stay archived.
-    if (entry.state !== "archived") {
-      await store.parkNeedsAttention(id, { kind: "capability-revoked", capability, at: new Date().toISOString() });
-    }
-    // Tear down what this specific capability backed, mirroring the per-capability
-    // cleanup an activation does when a manifest drops it.
-    if (capability === "netrules") await writeNetRulesDigest(id, undefined);
-    if (capability === "notifications") await clearOwnedNotifications(id);
-    if (capability === "schedule") await clearOwnedSchedules(id);
-    if (capability === "menu") await clearMenuCommandsForRemixlet(id);
-    await syncMirrorUnlocked();
-    await applyReloadScope(entry, scope);
-    return [...next].sort();
-  } catch (error) {
-    await store.restoreEntry(entry).catch(() => {});
-    await restoreLiveState(live);
-    throw error;
+    const { manifest } = await store.read(remixletId);
+    return (manifest.capabilities ?? []).includes(capability);
+  } catch {
+    return false;
   }
+}
+
+/**
+ * The capabilities a remixlet holds — the manager's capability panel. Read
+ * from the stored manifest, which is the approval record (see
+ * hasCapabilityGrant), so declared and approved are the same set by
+ * construction.
+ */
+export async function readRemixletCapabilities(id: string): Promise<string[]> {
+  const { manifest } = await store.read(id);
+  return normalizedCapabilities(manifest.capabilities);
 }
 
 async function createCapabilityProposal(
@@ -393,7 +471,10 @@ async function createCapabilityProposal(
   files: Record<string, string>,
   matches: string[],
   broadScope: boolean,
+  coversAllSites: boolean,
   netRulesChanged: boolean,
+  offSite: boolean,
+  authorization: SiteAuthorization | undefined,
 ): Promise<CapabilityApprovalProposal> {
   let siteKey: string;
   try {
@@ -417,9 +498,13 @@ async function createCapabilityProposal(
     matches,
     siteKey,
     broadScope,
+    coversAllSites,
     netRulesChanged,
+    offSite,
+    authorizedSite: authorization?.siteKey,
     createdAt: Date.now(),
     artifactDigest: await digestArtifactFiles(files),
+    authorization,
   };
   const proposals = await readCapabilityProposals();
   // One live proposal per remixlet. A newer agent attempt supersedes the old
@@ -429,15 +514,23 @@ async function createCapabilityProposal(
   }
   proposals[proposal.proposalId] = proposal;
   await ext.storage.session.set({ [CAPABILITY_PROPOSALS_KEY]: proposals });
-  const { createdAt: _, artifactDigest: __, ...publicProposal } = proposal;
+  const { createdAt: _, artifactDigest: __, authorization: ___, ...publicProposal } = proposal;
   return publicProposal;
 }
 
+/**
+ * A proposal is consumed only by the context that raised it: same remixlet,
+ * same capabilities, byte-identical artifact, and the same site authorization
+ * (or none on both sides). An approval that arrives from another tab or
+ * another site does not match, so the caller raises a fresh proposal instead
+ * of spending stale consent.
+ */
 async function consumeMatchingProposal(
   proposalId: string,
   remixletId: string,
   requested: string[],
   files: Record<string, string>,
+  authorization: SiteAuthorization | undefined,
 ): Promise<boolean> {
   const proposals = await readCapabilityProposals();
   const proposal = proposals[proposalId];
@@ -448,22 +541,68 @@ async function consumeMatchingProposal(
     Date.now() - proposal.createdAt <= PROPOSAL_MAX_AGE_MS &&
     proposal.remixletId === remixletId &&
     arraysEqual(proposal.requested, requested) &&
+    sameAuthorization(proposal.authorization, authorization) &&
     proposal.artifactDigest === (await digestArtifactFiles(files))
   );
+}
+
+function sameAuthorization(a: SiteAuthorization | undefined, b: SiteAuthorization | undefined): boolean {
+  if (a === undefined || b === undefined) return a === b;
+  return a.siteKey === b.siteKey && a.tabId === b.tabId;
+}
+
+/**
+ * The authorization as sent, or undefined when it binds to no site: the
+ * panel records an empty site key for a tab whose URL had not committed at
+ * bind time, and that must read as "no binding" (every scope goes through
+ * the dialog), never as a binding to nothing.
+ */
+function validSiteAuthorization(authorization: SiteAuthorization | undefined): SiteAuthorization | undefined {
+  if (authorization === undefined || authorization.siteKey.trim() === "") return undefined;
+  return { siteKey: authorization.siteKey, tabId: authorization.tabId };
+}
+
+/**
+ * Why the bound tab is no longer a page on the authorized site, or undefined
+ * while it still is. Read from the live tab, not from anything the panel or
+ * model reports. The wording is for the model: it explains why the tab was
+ * not reloaded and that this tab is not the page to verify against.
+ */
+async function siteAuthorizationDrift(authorization: SiteAuthorization): Promise<SiteAuthorizationDrift | undefined> {
+  const tab = await ext.tabs.get(authorization.tabId).catch(() => undefined);
+  if (tab?.id === undefined) {
+    return { kind: "closed", message: "the tab this conversation works on is closed, so no tab was reloaded" };
+  }
+  const url = tab.url ?? "";
+  if (!/^https?:/.test(url)) {
+    return {
+      kind: "off-site",
+      message:
+        `the tab this conversation works on no longer shows a web page on ${authorization.siteKey}. ` +
+        "Nothing was written. Tell the user the page moved; the panel offers them a button to reopen it.",
+    };
+  }
+  if (!urlWithinSiteKey(url, authorization.siteKey)) {
+    let current = "a different site";
+    try {
+      current = new URL(url).hostname || current;
+    } catch {
+      // Unparseable URL — the generic wording stands.
+    }
+    return {
+      kind: "off-site",
+      message:
+        `the tab this conversation works on is now showing ${current}, not ${authorization.siteKey}. ` +
+        `Nothing was written. Tell the user the page moved; the panel offers them a button to reopen ${authorization.siteKey}.`,
+    };
+  }
+  return undefined;
 }
 
 async function readCapabilityProposals(): Promise<Record<string, StoredCapabilityProposal>> {
   const stored = await ext.storage.session.get(CAPABILITY_PROPOSALS_KEY);
   // SAFETY: createCapabilityProposal is the sole writer for this session-scoped proposals key.
   return (stored[CAPABILITY_PROPOSALS_KEY] as Record<string, StoredCapabilityProposal> | undefined) ?? {};
-}
-
-async function readCapabilityGrants(): Promise<CapabilityGrants> {
-  return capabilityGrantStore.read();
-}
-
-async function writeCapabilityGrants(grants: CapabilityGrants): Promise<void> {
-  await capabilityGrantStore.write(grants);
 }
 
 function normalizedCapabilities(capabilities: readonly string[] | undefined): string[] {
@@ -483,42 +622,27 @@ function rollbackRationales(
   );
 }
 
-async function readNetRulesDigests(): Promise<NetRulesDigests> {
-  const stored = await ext.storage.local.get(NET_RULES_DIGESTS_KEY);
-  // SAFETY: writeNetRulesDigest is the sole writer for this local digest map.
-  return (stored[NET_RULES_DIGESTS_KEY] as NetRulesDigests | undefined) ?? {};
-}
-
-async function writeNetRulesDigest(remixletId: string, digest: string | undefined): Promise<void> {
-  const digests = await readNetRulesDigests();
-  if (digest === undefined) delete digests[remixletId];
-  else digests[remixletId] = digest;
-  await ext.storage.local.set({ [NET_RULES_DIGESTS_KEY]: digests });
-}
-
-/** SHA-256 of a remixlet's rules file content, or "" when it declares none. */
-async function netRulesDigest(manifest: RemixletManifest, files: Record<string, string>): Promise<string> {
-  const source = manifest.netRules ? files[manifest.netRules] : undefined;
-  if (source === undefined) return "";
-  const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(source)));
-  return [...digest].map((byte) => byte.toString(16).padStart(2, "0")).join("");
-}
-
 /**
- * Whether an activation rewrites the network rules a remixlet already holds a
- * grant for (H5). Only meaningful when `netrules` is both requested and
- * already granted — a fresh `netrules` grant rides the ordinary added-capability
- * gate, and a remixlet without the grant has no rules to protect.
+ * Whether an activation rewrites the network rules a remixlet already holds
+ * approval for (H5). The approved content is the previous stored version's own
+ * rules file — the store is the approval record, for rules content as for
+ * capability names. Only meaningful when `netrules` is both requested and
+ * already approved: a fresh `netrules` ask rides the ordinary added-capability
+ * gate, and a remixlet without the approval has no rules to protect.
  */
-async function netRulesContentChanged(
+function netRulesContentChanged(
   manifest: RemixletManifest,
   files: Record<string, string>,
-  previousGrants: readonly string[],
+  previousVersion: { manifest: RemixletManifest; files: Record<string, string> } | undefined,
+  previousApproved: readonly string[],
   requested: readonly string[],
-): Promise<boolean> {
-  if (!requested.includes("netrules") || !previousGrants.includes("netrules")) return false;
-  const approved = (await readNetRulesDigests())[manifest.id];
-  return approved !== undefined && approved !== (await netRulesDigest(manifest, files));
+): boolean {
+  if (!requested.includes("netrules") || !previousApproved.includes("netrules") || previousVersion === undefined) {
+    return false;
+  }
+  const approved = previousVersion.manifest.netRules ? previousVersion.files[previousVersion.manifest.netRules] : undefined;
+  const incoming = manifest.netRules ? files[manifest.netRules] : undefined;
+  return approved !== incoming;
 }
 
 async function digestArtifactFiles(files: Record<string, string>): Promise<string> {
@@ -551,12 +675,16 @@ function approvalRequiredMessage(
   added: readonly string[],
   scopeWidened: boolean,
   coversAllSites: boolean,
+  spansSuffix: boolean,
   netRulesChanged: boolean,
+  offSite: boolean,
 ): string {
   const parts: string[] = [];
   if (added.length > 0) parts.push(`capabilities: ${added.join(", ")}`);
   if (coversAllSites) parts.push("running on every site");
+  else if (spansSuffix) parts.push("running on every site under a shared domain");
   else if (scopeWidened) parts.push("running on more sites");
+  else if (offSite) parts.push("running outside the site this chat works on");
   if (netRulesChanged) parts.push("changed network rules");
   return `Approval required for ${parts.join(" and ") || "this change"}`;
 }
@@ -567,24 +695,23 @@ function approvalRequiredMessage(
  * equality falls out of the length check plus per-path compare: a path present
  * on only one side reads as undefined on the other and mismatches.
  */
-async function jsFilesChanged(id: string, incoming: Record<string, string>): Promise<boolean> {
-  let previous: Record<string, string>;
-  try {
-    previous = (await store.read(id)).files;
-  } catch {
-    // An unreadable previous version cannot prove the scripts are unchanged.
-    return true;
-  }
+function jsFilesChanged(previous: Record<string, string>, incoming: Record<string, string>): boolean {
   const jsPaths = (files: Record<string, string>) => Object.keys(files).filter(isSupportedScriptFile);
   const incomingJs = jsPaths(incoming);
   return incomingJs.length !== jsPaths(previous).length || incomingJs.some((path) => incoming[path] !== previous[path]);
 }
 
-/** Where a lifecycle change should become visible immediately. */
+/**
+ * Where a lifecycle change should become visible immediately. Box refresh
+ * revokes listeners, observers and handles in every live document whether or
+ * not this scope asks for a reload. A caller may still reload its own tab or
+ * every matching tab to remove page marks and elements left by the old run
+ * (wiki/decisions/leftover-marks.md).
+ */
 export interface ReloadScope {
-  /** One specific tab (the popup's current tab). */
+  /** One specific tab (the popup's current tab), reloaded even when the matches do not cover it. */
   reloadTabId?: number;
-  /** Every open tab the remixlet's matches cover (the manager's "applied live"). */
+  /** Reload every other open tab covered by the changed remixlet. */
   reloadMatching?: boolean;
 }
 
@@ -630,7 +757,6 @@ async function rollbackRemixletUnlocked(
   const files = await store.filesAt(id, sha);
   const targetManifest = parseStoredRemixletManifest(files[MANIFEST_FILE] ?? "");
   validateNetRulesFile(targetManifest, files);
-  const grants = await readCapabilityGrants();
   const requested = normalizedCapabilities(targetManifest.capabilities);
   const unsupported = requested
     .map((capability) => ({ capability, reason: remixletCapabilityDisabledReason(capability) }))
@@ -638,19 +764,28 @@ async function rollbackRemixletUnlocked(
   if (unsupported) {
     throw new Error(`rollback unavailable: capability "${unsupported.capability}" is disabled — ${unsupported.reason}`);
   }
-  const previousGrants = grants[id] ?? [];
-  const added = requested.filter((capability) => !previousGrants.includes(capability));
+  // The LIVE stored version is the approval record; the rollback target's own
+  // manifest proves nothing about current consent (its approval may have been
+  // superseded by versions since). Fail closed when the live version is
+  // unreadable, same as forward activation.
+  const liveVersion = await store.read(id).catch(() => undefined);
+  const previousApproved = liveVersion ? normalizedCapabilities(liveVersion.manifest.capabilities) : [];
+  const added = requested.filter((capability) => !previousApproved.includes(capability));
   // Same scope gate as forward activation: rolling BACK can just as easily
   // restore or introduce broad reach, so widening versus the live version — or
   // any all-sites target — must be approved, not just added capabilities.
   const scopeWidened = matchesWiden(previous.matches, targetManifest.matches);
   const coversAllSites = matchesCoverAllSites(targetManifest.matches);
-  const broadScope = scopeWidened || coversAllSites;
-  const netRulesChanged = await netRulesContentChanged(targetManifest, files, previousGrants, requested);
+  const spansSuffix = matchesSpanningPublicSuffix(targetManifest.matches).length > 0;
+  const broadScope = scopeWidened || coversAllSites || spansSuffix;
+  const netRulesChanged = netRulesContentChanged(targetManifest, files, liveVersion, previousApproved, requested);
+  // No site term here: a rollback is a manager action on an artifact the user
+  // selected, with no page binding to measure against, and the target's
+  // matches were the live scope of a version they already ran.
   if (
     (added.length > 0 || broadScope || netRulesChanged) &&
     (!capabilityApproval ||
-      !(await consumeMatchingProposal(capabilityApproval.proposalId, id, requested, files)))
+      !(await consumeMatchingProposal(capabilityApproval.proposalId, id, requested, files, undefined)))
   ) {
     return {
       ok: false,
@@ -660,20 +795,22 @@ async function rollbackRemixletUnlocked(
         targetManifest.name,
         requested,
         added,
-        previousGrants.filter((capability) => !requested.includes(capability)),
+        previousApproved.filter((capability) => !requested.includes(capability)),
         rollbackRationales(targetManifest.capabilityRationales, added),
         files,
         targetManifest.matches,
         broadScope,
+        coversAllSites || spansSuffix,
         netRulesChanged,
+        false,
+        undefined,
       ),
     };
   }
-  const live = await captureLiveState(grants);
+  const live = await captureLiveState();
   try {
+    // The rollback rewrites the stored HEAD, and with it the approval record.
     const entry = await store.rollback(id, sha);
-    await writeCapabilityGrants({ ...grants, [id]: requested });
-    await writeNetRulesDigest(id, requested.includes("netrules") ? await netRulesDigest(targetManifest, files) : undefined);
     await clearOwnedSchedules(id);
     await syncMirrorUnlocked();
     await clearMenuCommandsForRemixlet(id);
@@ -720,9 +857,9 @@ async function recordFailedVerificationExitUnlocked(
   if (target !== undefined && target !== recorded.headSha) {
     const outcome = await rollbackRemixletUnlocked(id, target, scope);
     if (outcome.ok) return { entry: outcome.entry, action: "rolled-back" };
-    // The verified version needs capability approval to restore (its grants
-    // were narrowed since). Nobody is here to click Allow, so drop the
-    // proposal and park instead — the user can roll back from the manager.
+    // The verified version needs capability approval to restore (the versions
+    // since narrowed what is approved). Nobody is here to click Allow, so drop
+    // the proposal and park instead — the user can roll back from the manager.
     await denyCapabilityProposalUnlocked(outcome.proposal.proposalId).catch(() => {});
   }
   const live = await captureLiveState();
@@ -769,11 +906,28 @@ export async function restoreRemixlet(id: string): Promise<RegistryEntry> {
 }
 
 /**
- * Hard delete: artifact, git history, capability grants, and every owned
- * live resource. Irreversible by design, so unlike the other lifecycle
- * mutations there is no compensation path — the store deletes the tree
- * before the registry entry, so a partial failure leaves the remixlet
- * listed and this operation retryable.
+ * Hard delete: artifact, git history, and every owned resource — the
+ * artifact's manifest is the capability approval record, so deleting it
+ * revokes everything at once. Irreversible by design, so unlike the other
+ * lifecycle mutations there is no compensation path; instead the operation is
+ * a fixed sequence of idempotent steps behind a durable "deleting" mark
+ * (wiki/ops/2026-09-04-security-remediation-plan.md item 9):
+ *
+ *   1. write the mark — from here the artifact is ineligible, and a worker
+ *      death anywhere below is finished by resumePendingDeletions at boot;
+ *   2. rebuild the mirror without it — scripts unregister, its DNR rules go,
+ *      menu commands and schedules reconcile away, no bridge token is in reach;
+ *   3. release its DNR allocation (after its rules: the reconciler finds
+ *      owned rules through the allocation map, so the reverse order orphans
+ *      them);
+*   4. forget everything else it owned: rmx.storage record, both tokens,
+ *      script log, pending proposals, usage, notifications, schedules, menu
+ *      commands;
+ *   5. erase the artifact (tree, history, look crop, registry entry);
+ *   6. clear the mark.
+ *
+ * A same-id install afterwards starts with fresh tokens and empty storage; a
+ * page still holding the old bridge token cannot authenticate.
  */
 export async function destroyRemixlet(id: string, scope: ReloadScope = {}): Promise<void> {
   return enqueueActivationMutation(() => destroyRemixletUnlocked(id, scope));
@@ -781,26 +935,96 @@ export async function destroyRemixlet(id: string, scope: ReloadScope = {}): Prom
 
 async function destroyRemixletUnlocked(id: string, scope: ReloadScope): Promise<void> {
   const entry = (await store.list()).find((candidate) => candidate.id === id);
-  if (!entry) throw new Error(`unknown remixlet: ${id}`);
-  await store.destroy(id);
-  const grants = await readCapabilityGrants();
-  if (grants[id]) {
-    const next = { ...grants };
-    delete next[id];
-    await writeCapabilityGrants(next);
+  if (!entry && !(await readDeletingMarks()).has(id)) throw new Error(`unknown remixlet: ${id}`);
+  await markDeleting(id);
+  await deletionFaultAfter("mark");
+  await finishDeletionUnlocked(id);
+  if (entry) await applyReloadScope(entry, scope);
+}
+
+/**
+ * Boot: finish any delete-forever a worker death interrupted. The mark is
+ * the only trigger — nothing here infers "orphan" from a failed registry
+ * read, and a disabled or archived artifact is never swept.
+ */
+export async function resumePendingDeletions(): Promise<void> {
+  for (const id of await readDeletingMarks()) {
+    await enqueueActivationMutation(() => finishDeletionUnlocked(id)).catch((error) =>
+      console.error(`[remixlet] resuming deletion of ${id} failed`, error),
+    );
   }
-  await writeNetRulesDigest(id, undefined);
-  await clearOwnedSchedules(id);
-  await clearOwnedNotifications(id);
-  await clearMenuCommandsForRemixlet(id);
-  await clearUsage(id);
+}
+
+/** Steps 2 to 6 above; every step tolerates having already run. */
+async function finishDeletionUnlocked(id: string): Promise<void> {
   await syncMirrorUnlocked();
-  await applyReloadScope(entry, scope);
+  await deletionFaultAfter("sync");
+  await releaseNetRuleAllocation(id);
+  await deletionFaultAfter("netrules");
+  await forgetRemixletResources(id);
+  await deletionFaultAfter("resources");
+  if ((await store.list()).some((candidate) => candidate.id === id)) await store.destroy(id);
+  await deletionFaultAfter("store");
+  await clearDeletingMark(id);
+}
+
+/**
+ * Everything a remixlet owns outside the store and the mirror. Shared by
+ * delete-forever and the failed-fresh-install cleanup, which otherwise left
+ * the tokens and allocation the mirror build had already minted.
+ */
+async function forgetRemixletResources(id: string): Promise<void> {
+  await clearRemixletStorage(id);
+  await clearTokens(id);
+  await clearScriptLog(id);
+  await clearCapabilityProposalsFor(id);
+  await clearUsage(id);
+  await clearOwnedNotifications(id);
+  await clearOwnedSchedules(id);
+  await clearMenuCommandsForRemixlet(id);
+}
+
+async function clearCapabilityProposalsFor(remixletId: string): Promise<void> {
+  const proposals = await readCapabilityProposals();
+  let changed = false;
+  for (const [proposalId, proposal] of Object.entries(proposals)) {
+    if (proposal.remixletId !== remixletId) continue;
+    delete proposals[proposalId];
+    changed = true;
+  }
+  if (changed) await ext.storage.session.set({ [CAPABILITY_PROPOSALS_KEY]: proposals });
+}
+
+/** Development builds only (deletion-fault.ts): the lifecycle harness's crash point. */
+async function deletionFaultAfter(step: string): Promise<void> {
+  if ((await testDeletionFault()) === step) throw new Error(`deletion interrupted after ${step} (test fault)`);
 }
 
 /** Per-site pause participates in the same live transaction as lifecycle changes. */
 export async function setSitePausedAtomic(siteKey: string, paused: boolean, scope: ReloadScope = {}): Promise<string[]> {
   return enqueueActivationMutation(() => setSitePausedAtomicUnlocked(siteKey, paused, scope));
+}
+
+/**
+ * Hold the activation reply until the remixlet's code has actually started in
+ * the reloaded tab (worker/box.ts waitForBoxRun), so "the tab reloaded with
+ * it live" is true when the model reads it and its first verification never
+ * judges a page the remixlet has not reached yet. Only when there is code to
+ * run on that page: a styles-only remixlet, or a page its matches exclude,
+ * has no run to wait for. Bounded, so a page that never gets its agent (a
+ * navigation mid-reload, a locked-down page) delays the reply, never holds it.
+ */
+const BOX_RUN_WAIT_MS = 8000;
+
+async function awaitBoxRunAfterReload(remixletId: string, tabId: number, since: number): Promise<void> {
+  const remixlet = (await readMirror()).find((entry) => entry.id === remixletId);
+  if (!remixlet || remixlet.js.length === 0) return;
+  const tab = await ext.tabs.get(tabId).catch(() => undefined);
+  if (!tab?.url || !runsOn(remixlet, tab.url, await readPausedSites())) return;
+  await waitForBoxRun(remixletId, tabId, since, BOX_RUN_WAIT_MS);
+  // Then its files' top-level code and first keep pass: the reply says the
+  // remixlet is live, so the page must already show what it does at load.
+  await settleTab(tabId);
 }
 
 async function setSitePausedAtomicUnlocked(siteKey: string, paused: boolean, scope: ReloadScope): Promise<string[]> {
@@ -812,10 +1036,9 @@ async function setSitePausedAtomicUnlocked(siteKey: string, paused: boolean, sco
     // paused site's — an owned remixlet's commands on its other hosts go too.
     if (paused) await clearMenuCommandsForPausedSites(next);
     await syncMirrorUnlocked();
-    // Reload after re-registration so a pause is a real kill switch: without
-    // this, already-injected code keeps running in every open tab until it is
-    // navigated. reloadMatching covers every tab the toggle changes; a resume
-    // reloads the same tabs so the remixlet comes back live.
+    // Refresh revokes live box authority without a reload. UI callers may
+    // still request reloads so old page marks disappear and a resumed box can
+    // start in a fresh document.
     if (scope.reloadTabId !== undefined) {
       await invalidateCaptureDigestForTab(scope.reloadTabId);
       await ext.tabs.reload(scope.reloadTabId).catch(() => {});
@@ -848,6 +1071,11 @@ async function reloadTabsForPauseChange(siteKey: string, exceptTabId?: number): 
   }
 }
 
+/**
+ * The caller's tab, then every open tab the entry's matches cover: the
+ * remixlet stopped running there (or an older version now runs), so the page
+ * must show that, with nothing of the old run left on it.
+ */
 async function applyReloadScope(entry: RegistryEntry, scope: ReloadScope): Promise<void> {
   // Each reload changes what runs on its page: clear the page's capture
   // digest first so the next capture there is a full one (capture-freshness).
@@ -855,13 +1083,12 @@ async function applyReloadScope(entry: RegistryEntry, scope: ReloadScope): Promi
     await invalidateCaptureDigestForTab(scope.reloadTabId);
     await ext.tabs.reload(scope.reloadTabId);
   }
-  if (scope.reloadMatching) {
-    for (const tab of await ext.tabs.query({})) {
-      if (tab.id === undefined || tab.id === scope.reloadTabId || !tab.url) continue;
-      if (urlMatchesAny(tab.url, entry.matches)) {
-        await invalidateCaptureDigestForUrl(tab.url);
-        await ext.tabs.reload(tab.id).catch(() => {});
-      }
+  if (!scope.reloadMatching) return;
+  for (const tab of await ext.tabs.query({})) {
+    if (tab.id === undefined || tab.id === scope.reloadTabId || !tab.url || !/^https?:/.test(tab.url)) continue;
+    if (urlMatchesAny(tab.url, entry.matches)) {
+      await invalidateCaptureDigestForUrl(tab.url);
+      await ext.tabs.reload(tab.id).catch(() => {});
     }
   }
 }
@@ -874,33 +1101,50 @@ export async function syncMirror(): Promise<void> {
 async function syncMirrorUnlocked(): Promise<void> {
   const previousMirror = await readMirror();
   const previousRules = await getDynamicRules();
-  const grants = await readCapabilityGrants();
+  // Read the schedule-owner snapshot at the same point as the authorization
+  // facts (the store contents the mirror is built from):
+  // reconcileScheduleOwners judges only the owners in it, so a registration
+  // that lands while this sync runs is never judged by facts that predate it
+  // (wiki/design/menu-reconcile-race.md).
+  const scheduleOwnerSnapshot = new Set(Object.keys((await readScheduleState()).owners));
   const mirror: ActiveRemixlet[] = [];
   const activeContents: { manifest: ReturnType<typeof parseRemixletManifest>; files: Record<string, string> }[] = [];
-  for (const entry of await store.active()) {
-    const { manifest, files } = await store.read(entry.id);
-    validateNetRulesFile(manifest, files);
+  // Eligibility is decided HERE, once per artifact, because the mirror build
+  // is the one place every artifact is read before any of its code can run;
+  // mirror membership is the verdict every runtime consumer reads
+  // (worker/eligibility.ts). Each artifact is judged on its own: a
+  // quarantined one (unreadable, invalid rules, bridge skew) gets no entry
+  // and a script-log line saying why, and the healthy rest are admitted —
+  // one bad artifact never aborts the rebuild for the others.
+  const deleting = await readDeletingMarks();
+  const previousQuarantine = await readQuarantine();
+  const quarantine: Record<string, QuarantineRecord> = {};
+  for (const listed of await store.list()) {
+    const verdict = await judgeArtifact(store, listed, deleting);
+    if (!verdict.eligible) {
+      if (verdict.quarantine) {
+        const previous = previousQuarantine[listed.id];
+        quarantine[listed.id] = {
+          reason: verdict.reason,
+          headSha: listed.headSha,
+          at: previous?.headSha === listed.headSha ? previous.at : Date.now(),
+        };
+        await appendScriptLogOnce(listed.id, "error", quarantineAdvice(verdict.reason));
+      }
+      continue;
+    }
+    const { entry, manifest, files } = verdict.content;
     activeContents.push({ manifest, files });
-    // The interceptor injects only for GRANTED observe capabilities — the
-    // human approval, not the manifest text, is what turns it on.
-    const granted = grants[entry.id] ?? [];
+    // A stored manifest only names APPROVED capabilities (the activation gate
+    // is the store's only write path), so declaring an observe capability is
+    // proof of the human approval that turns the interceptor on.
     const networkObserve = (manifest.capabilities ?? []).flatMap((capability) => {
       const pattern = observeHostPattern(capability);
-      return pattern !== undefined && granted.includes(capability) ? [pattern] : [];
+      return pattern !== undefined ? [pattern] : [];
     });
-    // Skew is decided HERE because the mirror build is the one place every
-    // enabled remixlet's manifest is read before any of its code can run. A
-    // skewed remixlet stays in the mirror but marked: registration and CSS
-    // skip it, and a script-log entry (the health surface the agent already
-    // reads) says why.
-    const skew = bridgeSkewReason(manifest.builtWith);
-    if (skew !== undefined) {
-      await appendScriptLogOnce(entry.id, "error", `not injected: ${skew} — rebuild the remixlet to fix this`);
-    }
     const active: ActiveRemixlet = {
       id: entry.id,
       bridgeToken: await bridgeTokenFor(entry.id),
-      relayToken: await relayTokenFor(entry.id),
       matches: manifest.matches,
       js: (manifest.scripts ?? []).flatMap((script) => {
         // Worker-side assertion of the write-time invariant (isSupportedScriptFile
@@ -910,41 +1154,34 @@ async function syncMirrorUnlocked(): Promise<void> {
         const code = files[script.file];
         return code === undefined || !isSupportedScriptFile(script.file)
           ? []
-          : [{ code, world: script.world, runAt: script.runAt }];
+          : [{ code, file: script.file, runAt: script.runAt }];
       }),
       css: (manifest.styles ?? []).flatMap((style) => (files[style] === undefined ? [] : [files[style]])),
       capabilities: manifest.capabilities ?? [],
       networkObserve,
     };
-    if (skew !== undefined) active.skew = skew;
     mirror.push(active);
   }
   const grantedNetRules = new Set(
-    Object.entries(grants)
-      .filter(([, capabilities]) => capabilities.includes("netrules"))
-      .map(([id]) => id),
+    activeContents
+      .filter(({ manifest }) => (manifest.capabilities ?? []).includes("netrules"))
+      .map(({ manifest }) => manifest.id),
   );
   try {
     await writeMirror(mirror);
-    await reconcileUserScripts();
+    await writeQuarantine(quarantine);
+    await reconcileRegistrations();
     await reconcileNetRules(activeContents, await readPausedSites(), grantedNetRules);
     await reconcileMenuCommands();
     await reconcileScheduleOwners(
-      new Set(
-        mirror
-          .filter(
-            (remixlet) =>
-              remixlet.capabilities.includes("schedule") &&
-              (grants[remixlet.id] ?? []).includes("schedule"),
-          )
-          .map((remixlet) => remixlet.id),
-      ),
+      new Set(mirror.filter((remixlet) => remixlet.capabilities.includes("schedule")).map((remixlet) => remixlet.id)),
+      scheduleOwnerSnapshot,
     );
     // Counts changed for any tab the mirror covers; recompute them all.
     await refreshAllBadges().catch(() => {});
   } catch (error) {
     await writeMirror(previousMirror).catch(() => {});
-    await reconcileUserScripts().catch(() => {});
+    await reconcileRegistrations().catch(() => {});
     await replaceDynamicRules(previousRules).catch(() => {});
     throw error;
   }
@@ -952,16 +1189,14 @@ async function syncMirrorUnlocked(): Promise<void> {
 
 interface LiveState {
   mirror: ActiveRemixlet[];
-  grants: CapabilityGrants;
   dynamicRules: chrome.declarativeNetRequest.Rule[];
   schedules: ScheduleState;
   scheduleSession: string[];
 }
 
-async function captureLiveState(grants?: CapabilityGrants): Promise<LiveState> {
+async function captureLiveState(): Promise<LiveState> {
   return {
     mirror: await readMirror(),
-    grants: grants ?? (await readCapabilityGrants()),
     dynamicRules: await getDynamicRules(),
     schedules: await readScheduleState(),
     scheduleSession: await readScheduleSessionState(),
@@ -970,13 +1205,10 @@ async function captureLiveState(grants?: CapabilityGrants): Promise<LiveState> {
 
 async function restoreLiveState(state: LiveState): Promise<boolean> {
   let restored = true;
-  await writeCapabilityGrants(state.grants).catch(() => {
-    restored = false;
-  });
   await writeMirror(state.mirror).catch(() => {
     restored = false;
   });
-  await reconcileUserScripts().catch(() => {
+  await reconcileRegistrations().catch(() => {
     restored = false;
   });
   await replaceDynamicRules(state.dynamicRules).catch(() => {
@@ -994,10 +1226,16 @@ async function restoreLiveState(state: LiveState): Promise<boolean> {
 async function restoreStoreAfterFailedActivation(id: string, previous?: RegistryEntry): Promise<boolean> {
   try {
     if (previous) await store.rollback(id, previous.headSha);
-    // A failed FRESH install must vanish entirely: nothing was ever live to
-    // inspect, and leaving it archived would reserve the id forever now that
-    // archived remixlets are never editable.
-    else await store.destroy(id);
+    else {
+      // A failed FRESH install must vanish entirely: nothing was ever live to
+      // inspect, and leaving it archived would reserve the id forever now that
+      // archived remixlets are never editable. The mirror build that failed
+      // may already have minted its tokens and DNR allocation — forget those
+      // too, or the next install under the id would inherit them.
+      await store.destroy(id);
+      await releaseNetRuleAllocation(id);
+      await forgetRemixletResources(id);
+    }
     return true;
   } catch {
     return false;

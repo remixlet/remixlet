@@ -1,3 +1,4 @@
+import { LEFTOVER_SECTION_HEADING, citesLeftoverMark } from "../shared/marks.js";
 import { MANIFEST_FILE, README_FILE } from "../shared/remixlet.js";
 import type { AgentToolOutput, AgentToolSpec } from "./types.js";
 
@@ -7,6 +8,12 @@ const LIST = "list_remixlets";
 const READ = "read_remixlet";
 const WRITE = "write_remixlet";
 const INSPECT_DESIGN = "inspect_design";
+// The look review (wiki/design/look-review.md): after a UI-adding write the
+// turn owes look_at_change (cropped side-by-side screenshots of the added
+// control and the host exemplar) followed by record_look (the model's verdict,
+// read mechanically from params). It replaced the design-parity assertion.
+const LOOK = "look_at_change";
+const RECORD_LOOK = "record_look";
 // The structured probes (src/panel/tools/page-probes.ts) — belt-and-braces
 // alongside the provenance-driven #lastUntrustedPageData tracking, and the
 // default post-write observation lane.
@@ -32,7 +39,12 @@ const CLICK = "click_element";
 // way. Requiring the RUN (not a pass) keeps honest failure reporting possible.
 const VERIFY = "assert_page_state";
 const READ_LOGS = "read_remixlet_logs";
-const PAGE_DATA_TOOLS = new Set([CAPTURE, "evaluate_js", ...PAGE_PROBES]);
+const PAGE_DATA_TOOLS = new Set([CAPTURE, LOOK, ...PAGE_PROBES]);
+// Look repairs a turn may spend on "differs" verdicts before the verdict is
+// accepted as final and described to the user instead — a backstop on
+// perfectionism about visible detail, not a cap on an oracle bug (the oracle
+// is the model's eyes, and only pixels can trigger it).
+const LOOK_REPAIR_LIMIT = 2;
 /** Chars of page-derived tool output retained for the data-grounding lint. */
 const OBSERVED_PAGE_TEXT_BUDGET = 2_000_000;
 
@@ -61,9 +73,15 @@ interface SubmittedFile {
 interface ToolParams {
   assertions?: ToolAssertion[];
   capabilities?: string[];
+  evidence?: string;
   files?: SubmittedFile[];
+  activateHeld?: boolean;
   id?: string;
   verdict?: string;
+  selector?: string;
+  referenceSelector?: string;
+  properties?: string[];
+  observed?: string;
 }
 
 interface WriteDetails {
@@ -74,10 +92,36 @@ interface LogDetails {
   count?: number;
 }
 
+/** capture_page's details: the leftover mark names its census found (shared/marks.ts). */
+interface CaptureDetails {
+  leftovers?: string[];
+}
+
+/**
+ * record_look's tool_end details as the panel reads them: the tool's own
+ * verdict and observed text, plus the reference the look compared against
+ * (added here — the contract is the only party that knows the default and
+ * whether the model overrode it). Details never reach the model.
+ */
+interface RecordLookDetails {
+  verdict?: string;
+  observed?: string;
+  referenceSelector?: string;
+  referenceOverridden: boolean;
+  inspectedSelector?: string;
+}
+
+/** click_element's outcome: false means the page-side click policy refused it and nothing was dispatched. */
+interface ClickDetails {
+  clicked?: boolean;
+}
+
 interface VerificationDetails {
   verificationBlockedByObserverLoop?: boolean;
   observerFeedbackLoopRemixletIds?: string[];
   verificationSucceeded?: boolean;
+  /** Set when the result text carried runtime log lines (the observer-loop block): the count shown. */
+  runtimeLogLinesShown?: number;
 }
 
 /**
@@ -115,9 +159,18 @@ export function isContractNudgePrompt(text: string): boolean {
 }
 
 /**
+ * Appended to every write_remixlet contract bounce: the file set was kept, so
+ * the remedy is the missing step plus a re-submit, not a regeneration.
+ */
+export const HELD_WRITE_NOTE =
+  "Your file set is held and was not discarded: after the missing step, call write_remixlet again with " +
+  '{"activateHeld": true} and your commit message, and NO files, to activate exactly these files without resending ' +
+  "them. Sending files again replaces the held set.";
+
+/**
  * The continuation the panel injects when a conversation resumes on top of an
- * unverified activation (the verifying turn died with the runtime — on the
- * drawer surface the activation's own tab reload destroys it). It carries the
+ * unverified activation (the verifying turn died with the runtime — a panel
+ * closed or killed right after the activation's reload). It carries the
  * finish-check marker so the panel renders it as an action row, not a user
  * bubble, and it drives the same verify-or-fix loop the in-turn nudge does —
  * here after the reload rather than before the model stopped. Bounded by the
@@ -166,9 +219,9 @@ export class AgentContract {
   #sequence = 0;
   // A verification obligation recovered from a resumed conversation's history
   // (session-tail.ts): the last activation was never verified because the turn
-  // that would have verified it died — on the drawer surface, the activation's
-  // own tab reload destroys the runtime. Seeded once into the first turn after
-  // resume so that turn cannot complete without an assert_page_state, then
+  // that would have verified it died with the panel's runtime. Seeded once
+  // into the first turn after resume so that turn cannot complete without an
+  // assert_page_state, then
   // consumed. Without this the obligation is lost with the dead runtime and the
   // broken build reads as finished.
   #resumedUnverifiedActivation: boolean;
@@ -176,6 +229,16 @@ export class AgentContract {
   #resumedObserverRepairIds: string[];
   #lastWrite = 0;
   #lastCapture = 0;
+  // The sequence value at the latest beginTurn (every kind, grant
+  // continuations included): a marker above it belongs to this turn segment.
+  // The write gate's capture exemption keys on `#lastWrite > #turnStart` rather
+  // than `#lastWrite > 0` because a grant continuation keeps #lastWrite.
+  #turnStart = 0;
+  // The turn's latest capture named these marks as leftovers: attributes and
+  // classes a removed remixlet left on the page (wiki/decisions/leftover-marks.md).
+  // A verdict whose evidence cites one is refused, since the mark is known
+  // false page state. Set mechanically from the capture's details.
+  #leftoverMarks: string[] = [];
   #lastList = 0;
   #listedIds = new Set<string>();
   // Remixlet ids whose current content this turn has seen — via read_remixlet
@@ -198,11 +261,33 @@ export class AgentContract {
   #pendingObserverRepair = false;
   #pendingObserverRepairIds = new Set<string>();
   // Set when this turn's write matched the introduces-UI heuristic: the
-  // verification that clears the turn must then include the look-checking
-  // assertion kinds (design-parity + not-clipped), not just any assertion —
-  // the SoundCloud session C verified a wrong design with four assertions
-  // that could not fail (wiki/raw/handoffs/design-inspection-enforcement.md).
-  #pendingDesignAssertions = false;
+  // verification that clears the turn must then include the fit-checking
+  // assertion kinds (visible + not-clipped on the control), not just any
+  // assertion — the SoundCloud session C verified a wrong design with four
+  // assertions that could not fail (wiki/raw/handoffs/design-inspection-enforcement.md).
+  #pendingLookAssertions = false;
+  // Set alongside it: the turn also owes a LOOK — look_at_change after the
+  // write (so the crops show the activated control), then record_look. This
+  // is where "looks like the host" is judged now; the retired design-parity
+  // assertion compared computed-style strings and failed on identical paint
+  // (wiki/design/look-parity-review.md). Cleared by a record_look whose
+  // look_at_change ran after the latest write.
+  #pendingLookReview = false;
+  #lastLook = 0;
+  // The exemplar this turn inspected first (a digest-mode inspect_design):
+  // look_at_change compares against it by default, tying the before-build
+  // exemplar to the after-build comparison. An explicit referenceSelector
+  // overrides it, and the override is recorded so the panel can say
+  // "compared against X".
+  #lastInspectDesignSelector: string | undefined;
+  #lookReferenceSelector: string | undefined;
+  #lookReferenceOverridden = false;
+  // "differs" verdicts recorded this turn — the look-repair cycle bound.
+  #lookDiffers = 0;
+  // record_look said "wrong-kind": the turn cannot finish on this control. A
+  // successful write clears it and re-arms the look obligations, so the
+  // rebuilt control is looked at afresh.
+  #pendingLookRebuild = false;
   // The file set this turn's latest successful write activated (path →
   // content, as submitted). Retained so a post-write assert_page_state can be
   // linted for self-reference: an expected value that also appears in the
@@ -210,6 +295,15 @@ export class AgentContract {
   // the SoundCloud 181px false pass asserted the exact height its own CSS
   // set while the real content was 277px. Cleared every beginTurn.
   #lastWriteFiles = new Map<string, string>();
+  // The file set of this turn's last write_remixlet that a contract check
+  // bounced. write_remixlet takes the COMPLETE file set every call, so a
+  // bounce that discards it costs a full regeneration (~2k output tokens,
+  // 35-40 s; the 2026-09-09 SoundCloud session paid it twice and minified its
+  // third attempt to save tokens). Kept for the turn: the model does the
+  // missing step, then re-submits with activateHeld instead of the files. One
+  // at a time — a later write that carries files replaces it, a write that
+  // passes the gate consumes it, beginTurn clears it.
+  #heldWriteFiles: SubmittedFile[] | undefined;
   // Everything page-derived tools returned this conversation (lowercased,
   // oldest chunks evicted at the budget). The data-grounding lint checks
   // asserted DATA values against it: an expected value found in neither this
@@ -235,19 +329,30 @@ export class AgentContract {
   // handling-…): once a post-activation assert_page_state runs whose
   // verificationSucceeded is not true (a timed-out retry window included —
   // the failure lives in the detail, never in a tool error), the next
-  // write_remixlet bounces unless read_remixlet_logs ran after that failure.
+  // write_remixlet bounces unless the runtime log was read since the
+  // activation that check is about (#lastLogsRead > #lastWrite). Since the
+  // activation, not since the failure: any read after the activation shows
+  // that activation's own output, and a read batched alongside the failing
+  // assert (the prompt says to batch independent calls) completes before the
+  // assert's retry window lapses — the 2026-09-09 SoundCloud session read the
+  // loop warning that way, diagnosed it, and was bounced into a second read
+  // that returned byte-identical lines (~40 s, ~2k output tokens for nothing).
   // The Spotify album-label session burned two full rewrites on a wrong theory
   // before the first log read; the single productive step was the one that
   // read evidence. Set/cleared mechanically from tool results, never prose.
   #pendingFailureEvidence = false;
-  #failureLogsRead = false;
-  // The post-failure log read came back empty: nothing recorded means the
-  // script logged nothing, so the next write must at least instrument —
-  // "first failure → instrument; fix only with the log in hand". The check is
-  // deliberately just "logging calls present in the submitted JS": verifying
-  // "gained logging without changing behavior" is unenforceable and invites
-  // ritual compliance (the Phase A strict-but-wrong-gate lesson).
-  #failureLogsEmpty = false;
+  // Sequence of the latest log read this turn: a read_remixlet_logs success,
+  // or an assert_page_state whose result carried the runtime log lines (the
+  // observer-loop block does — page-probes.ts). Reset per turn: evidence is
+  // read for the turn's own activation.
+  #lastLogsRead = 0;
+  // That read came back empty: nothing recorded means the script logged
+  // nothing, so the next write must at least instrument — "first failure →
+  // instrument; fix only with the log in hand". The check is deliberately
+  // just "logging calls present in the submitted JS": verifying "gained
+  // logging without changing behavior" is unenforceable and invites ritual
+  // compliance (the Phase A strict-but-wrong-gate lesson).
+  #lastLogsEmpty = false;
   #lastAssess = 0;
   #lastInspectDesign = 0;
   #assessedInfeasible = false;
@@ -302,25 +407,33 @@ export class AgentContract {
     // feasibility verdict and store knowledge — re-running them is what made
     // the SoundCloud log "check what's possible" AFTER the user had already
     // approved the access. A fresh capture is still required: the page may
-    // have changed, and every write must follow a current look. A grant can
-    // also arrive on an ordinary later turn (it stays unspent until a build
-    // uses it — the second SoundCloud run lost it to a "why did you stop?"
-    // interruption); such turns get the full reset below, just with the
+    // have changed, and the turn's first write must follow a current look. A
+    // grant can also arrive on an ordinary later turn (it stays unspent until
+    // a build uses it — the second SoundCloud run lost it to a "why did you
+    // stop?" interruption); such turns get the full reset below, just with the
     // granted authority available.
+    this.#turnStart = this.#sequence;
     this.#lastCapture = 0;
+    this.#leftoverMarks = [];
     // The click IS the plan: the user authorized exactly these names, and they
     // stay available every turn the grant is still unspent — the write gate
     // below is where the set is enforced, on the manifest a build declares.
     this.#grantedCapabilities = new Set(grantedCapabilities ?? []);
     this.#lastUntrustedPageData = 0;
     this.#pendingVerification = this.#pendingObserverRepair;
-    this.#pendingDesignAssertions = false;
+    this.#pendingLookAssertions = false;
+    this.#pendingLookReview = false;
+    this.#pendingLookRebuild = false;
+    this.#lookDiffers = 0;
+    this.#lookReferenceSelector = undefined;
+    this.#lookReferenceOverridden = false;
     this.#lastWriteFiles.clear();
+    this.#heldWriteFiles = undefined;
     this.#pendingBothStates = false;
     this.#bothStatesStage = 0;
     this.#pendingFailureEvidence = false;
-    this.#failureLogsRead = false;
-    this.#failureLogsEmpty = false;
+    this.#lastLogsRead = 0;
+    this.#lastLogsEmpty = false;
     this.#violations = [];
     // Recovered obligation: a resumed conversation whose last activation was
     // never verified enters its first turn already owing verification, so the
@@ -340,6 +453,7 @@ export class AgentContract {
     }
     if (grantContinuation) return;
     this.#lastWrite = 0;
+    this.#lastLook = 0;
     this.#lastList = 0;
     this.#listedIds.clear();
     this.#knownIds.clear();
@@ -349,6 +463,7 @@ export class AgentContract {
     // continuation: the exemplar and container were inspected for the same
     // request the grant resumes. (A fresh capture is still required above.)
     this.#lastInspectDesign = 0;
+    this.#lastInspectDesignSelector = undefined;
     this.#assessedInfeasible = false;
     this.#assessedNeedsVisibility = false;
     this.#assessedTurnEndsWithoutBuild = false;
@@ -359,7 +474,8 @@ export class AgentContract {
     params: ToolCallInput,
     signal: AbortSignal | undefined,
   ): Promise<AgentToolOutput> {
-    const toolParams = decodeToolParams(params);
+    let toolParams = decodeToolParams(params);
+    let effectiveParams = params;
     const sequence = ++this.#sequence;
     if (spec.name === ASSESS && this.#lastUntrustedPageData === 0) {
       this.#violate(
@@ -367,11 +483,57 @@ export class AgentContract {
         "Contract violation: assess_feasibility must run after observing the page (capture_page or a probe like query_elements) so the verdict is grounded in real page data, not assumption.",
       );
     }
-    if (spec.name === WRITE) this.#assertWriteAllowed(toolParams);
+    if (spec.name === ASSESS) this.#assertEvidenceNotLeftover(toolParams);
+    if (spec.name === WRITE) {
+      toolParams = this.#resolveWriteFiles(toolParams);
+      // SAFETY: the resolved write params are the decoded call with the held file set substituted, same schema shape.
+      effectiveParams = toolParams as ToolCallInput;
+      this.#assertWriteAllowedOrHold(toolParams);
+    }
+    if (spec.name === RECORD_LOOK && this.#lastLook <= this.#lastWrite) {
+      // The verdict records what the model SAW in the crops of the activated
+      // control; without a look after the latest write there is nothing seen.
+      this.#violate(
+        RECORD_LOOK,
+        "Contract violation: record_look must follow a look_at_change run in this turn after your latest write — the verdict records what you saw in the crops, so look first, then record.",
+      );
+    }
+    // The look's reference defaults to the exemplar inspected this turn: the
+    // element inspect_design read BEFORE the build is the thing the build was
+    // supposed to match, so the after-build comparison targets it unless the
+    // model names another (an override the panel is told about).
+    let lookReference: string | undefined;
+    let lookReferenceOverridden = false;
+    if (spec.name === LOOK) {
+      const inspected = this.#lastInspectDesignSelector;
+      const given = toolParams.referenceSelector;
+      lookReference = given ?? inspected;
+      lookReferenceOverridden = given !== undefined && inspected !== undefined && given !== inspected;
+      if (given === undefined && inspected !== undefined) {
+        // SAFETY: params is the decoded look_at_change object; adding the optional referenceSelector keeps its schema shape.
+        effectiveParams = { ...(params as object), referenceSelector: inspected } as ToolCallInput;
+      }
+    }
 
     // SAFETY: pi has decoded params against this tool's TypeBox schema before invoking the contract.
-    const output = await spec.execute(params as never, signal);
+    const output = await spec.execute(effectiveParams as never, signal);
     this.#recordSuccess(spec.name, toolParams, output, sequence);
+    if (spec.name === LOOK) {
+      this.#lookReferenceSelector = lookReference;
+      this.#lookReferenceOverridden = lookReferenceOverridden;
+      const note =
+        lookReference === undefined
+          ? ""
+          : lookReferenceOverridden
+            ? ` Note from the extension: you compared against ${JSON.stringify(lookReference)}, not the exemplar you ` +
+              `inspected this turn (${JSON.stringify(this.#lastInspectDesignSelector)}); the recorded verdict will say so. ` +
+              "If the inspected element WAS the right exemplar, look again without a referenceSelector."
+            : toolParams.referenceSelector === undefined
+              ? ` Reference: the exemplar you inspected this turn, ${JSON.stringify(lookReference)}.`
+              : "";
+      return note === "" ? output : { ...output, text: `${output.text}${note}` };
+    }
+    if (spec.name === RECORD_LOOK) return this.#recordLookResult(toolParams, output);
     if (spec.name === ASSESS) {
       // Whether this turn builds or stops is deterministic contract state, so
       // the instruction is authored here, not left to the model. A
@@ -428,7 +590,59 @@ export class AgentContract {
       }
       if (warnings.length > 0) return { ...output, text: `${output.text}\n\n${warnings.join("\n\n")}` };
     }
+    // Construction lint, warning-only (wiki/design/look-review.md §Layer 0):
+    // a UI-adding write whose style.css hardcodes typography or colour on
+    // its own selectors is building a lookalike instead of inheriting the
+    // host's cascade — the one real typography divergence in 37 sessions
+    // came from exactly this, and it would have matched by construction had
+    // the text inherited. Warning is the ceiling: a control outside any text
+    // flow legitimately needs values.
+    if (spec.name === WRITE && writeIntroducesUi(toolParams)) {
+      const literals = hardcodedTypography(toolParams);
+      if (literals.length > 0) {
+        return {
+          ...output,
+          text:
+            `${output.text}\n\nDesign warning from the extension: ${literals.join("; ")}. Text you add inside a host text ` +
+            "container should set no font-*, color or line-height at all and inherit the host's; a control should reuse " +
+            "the host's own class when inspect_design showed it stable, else its tokens (var(--…)). Hardcoded literals " +
+            "are how added text ends up a weight off from the host's. A control outside any text flow may legitimately " +
+            "need values — then keep them, and look_at_change will show whether they read right.",
+        };
+      }
+    }
     return output;
+  }
+
+  /**
+   * record_look's outcome, read mechanically from the verdict param: the
+   * obligations it clears, the repair budget it spends, and the text that
+   * tells the model what the extension will do with it. Details gain the
+   * reference the look compared against (details never reach the model; the
+   * panel stores them with the verdict).
+   */
+  #recordLookResult(params: ToolParams, output: AgentToolOutput): AgentToolOutput {
+    const verdict = lookVerdict(params);
+    // SAFETY: tool details are JSON data returned by the extension-owned record_look implementation.
+    const produced = output.details instanceof Object ? (output.details as ToolDetails) : undefined;
+    const details: RecordLookDetails = { referenceOverridden: this.#lookReferenceOverridden };
+    const recordedVerdict = produced ? readStringProperty(produced, "verdict") : undefined;
+    if (recordedVerdict !== undefined) details.verdict = recordedVerdict;
+    const observed = produced ? readStringProperty(produced, "observed") : undefined;
+    if (observed !== undefined) details.observed = observed;
+    if (this.#lookReferenceSelector !== undefined) details.referenceSelector = this.#lookReferenceSelector;
+    if (this.#lastInspectDesignSelector !== undefined) details.inspectedSelector = this.#lastInspectDesignSelector;
+    let note = "";
+    if (verdict === "differs") {
+      note =
+        this.#lookDiffers <= LOOK_REPAIR_LIMIT
+          ? ` If you can point at the pixels that differ, fix them with ONE styles-only write, then look_at_change and ` +
+            `record_look again (look repairs left this turn: ${LOOK_REPAIR_LIMIT - this.#lookDiffers + 1}). A difference ` +
+            "you cannot see does not exist — do not rewrite for one."
+          : " This is the final look verdict for this turn: do not write again for the look. Describe what you see to " +
+            "the user in your closing note; it is recorded as the remixlet's \"Visual review\" in the control center.";
+    }
+    return { ...output, text: `${output.text}${note}`, details };
   }
 
   /**
@@ -449,9 +663,7 @@ export class AgentContract {
       );
     }
     const parts: string[] = [];
-    parts.push(
-      this.#lastCapture > this.#lastWrite ? "capture done" : "capture_page still needed before write_remixlet",
-    );
+    parts.push(this.#captureOwedForWrite() ? "capture_page still needed before write_remixlet" : "capture done");
     if (this.#lastList === 0) {
       parts.push("inventory NOT recorded — list_remixlets has not succeeded this turn");
     } else if (this.#listedIds.size === 0) {
@@ -473,7 +685,7 @@ export class AgentContract {
   // The grounding lint's scan: style-equals/attr-equals assertions whose
   // string "expected" is specific enough to be someone's constant AND appears
   // verbatim in a just-written file. Read mechanically from the params, the
-  // way includesDesignAssertions reads conditions — never from prose.
+  // way includesLookAssertions reads conditions — never from prose.
   #selfReferentialAssertions(params: ToolParams): string[] {
     const assertions = params.assertions ?? [];
     const flagged: string[] = [];
@@ -586,16 +798,31 @@ export class AgentContract {
         "Contract violation: write_remixlet activated a change, but no assert_page_state ran afterward. Verify the user-visible effect with explicit assertions (visible, style-equals, counts) before completing.",
       );
     }
-    if (this.#pendingDesignAssertions) {
+    if (this.#pendingLookAssertions) {
       this.#violate(
         VERIFY,
-        "Contract violation: this turn's write added UI, but the verification did not check its look. Run assert_page_state again including at least one design-parity assertion comparing your control against the host's own control of the same kind, and one not-clipped assertion on your control.",
+        "Contract violation: this turn's write added UI, but the verification did not check that the control is present and fits. Run assert_page_state again including a visible assertion and a not-clipped assertion on your control.",
+      );
+    }
+    if (this.#pendingLookRebuild) {
+      this.#violate(
+        WRITE,
+        "Contract violation: record_look said the control is the wrong kind. Rebuild it as the host's own kind of control (write_remixlet), verify it, then look_at_change and record_look again before completing.",
       );
     }
     if (this.#pendingBothStates) {
       this.#violate(
         VERIFY,
         "Contract violation: this turn's write wires a click handler, but the control's behavior was never exercised — presence and look assertions cannot catch a handler that does nothing. Verify both states now: click_element the control, assert_page_state the changed state, click_element it again, and assert_page_state that the original state is restored.",
+      );
+    }
+    // Last on purpose: a click-wired build hears about its unexercised handler
+    // before its unlooked-at look, so the finish-check (one violation per
+    // nudge) asks for the behaviour first and the look second.
+    if (this.#pendingLookReview) {
+      this.#violate(
+        RECORD_LOOK,
+        "Contract violation: this turn's write added UI, but nobody looked at it. Run look_at_change on your control and the host exemplar it was built from, look at the two crops as a designer would, then record_look with what you see.",
       );
     }
     if (this.#violations.length > 0) throw new Error(this.violations.join(" "));
@@ -611,21 +838,87 @@ export class AgentContract {
       this.#violations.length === 0 &&
       !this.#pendingObserverRepair &&
       !this.#pendingVerification &&
-      !this.#pendingDesignAssertions &&
+      !this.#pendingLookAssertions &&
+      !this.#pendingLookReview &&
+      !this.#pendingLookRebuild &&
       !this.#pendingBothStates
     );
   }
 
+  // The turn's first write owes a capture_page; a follow-up write after a
+  // successful write in this turn segment does not (see #assertWriteAllowed).
+  #captureOwedForWrite(): boolean {
+    return this.#lastCapture === 0 && this.#lastWrite <= this.#turnStart;
+  }
+
+  /**
+   * Which file set this write_remixlet call means. Files sent explicitly are
+   * the payload (and supersede anything held); `activateHeld` substitutes the
+   * file set a contract check bounced earlier this turn. A call with neither
+   * is an invalid payload: a plain Error, never a bounce, and nothing is held
+   * from it.
+   */
+  #resolveWriteFiles(params: ToolParams): ToolParams {
+    if (params.files !== undefined) {
+      this.#heldWriteFiles = undefined;
+      return params;
+    }
+    const held = this.#heldWriteFiles;
+    if (params.activateHeld === true) {
+      if (held === undefined) {
+        throw new Error(
+          "write_remixlet: activateHeld was set but no file set is held — nothing this turn bounced off a contract " +
+            "check, or a later write already consumed or replaced it. Send the complete file set in files.",
+        );
+      }
+      return { ...params, files: held };
+    }
+    throw new Error(
+      held === undefined
+        ? "write_remixlet: files are missing. Send the complete file set in files."
+        : "write_remixlet: files are missing. The file set from this turn's bounced write is still held: send " +
+            '{"activateHeld": true} with your commit message to activate exactly those files, or send files to ' +
+            "write a different set.",
+    );
+  }
+
+  /**
+   * The write gate, with the bounce keeping the file set. Only a
+   * ContractViolationError holds: it means the payload was fine and a
+   * prerequisite step was missing, so the same files become right once the
+   * step runs. A malformed payload (plain Error from parseWriteTarget) is not
+   * worth keeping. Once the gate passes the held set is spent: a tool-level
+   * refusal after this point is an invalid payload the model must rewrite.
+   */
+  #assertWriteAllowedOrHold(params: ToolParams): void {
+    try {
+      this.#assertWriteAllowed(params);
+    } catch (error) {
+      if (error instanceof ContractViolationError && params.files !== undefined) {
+        this.#heldWriteFiles = params.files;
+        throw new ContractViolationError(`${error.message} ${HELD_WRITE_NOTE}`);
+      }
+      throw error;
+    }
+    this.#heldWriteFiles = undefined;
+  }
+
   #assertWriteAllowed(params: ToolParams): void {
-    // Inventory and feasibility are once-per-turn obligations: neither changes
-    // when the agent's own write activates, so a same-turn follow-up write
-    // (fixing a failed verification) must not repeat them as ritual. Capture
-    // is different — activation reloads the tab, so EVERY write needs a look
-    // at the page as it is now, hence the after-last-write comparison.
+    // Inventory, feasibility and capture are once-per-turn obligations: a
+    // same-turn follow-up write (fixing a failed verification) must not repeat
+    // them as ritual. Capture used to be re-owed after every write because
+    // activation reloads the tab — but by the time a follow-up write arrives
+    // the model has already clicked, asserted and read the runtime logs on
+    // the reloaded page, which is a closer look than a capture gives, and the
+    // SoundCloud run of 2026-09-09 paid ~40 s and ~2k output tokens to bounce
+    // a correct fix, recapture, use nothing from it and regenerate the whole
+    // file set. A bounce on this tool costs a full regeneration, so the gate
+    // only guards the turn's first write (`#turnStart`: a grant continuation
+    // keeps #lastWrite but still owes its own first look).
     if (this.#lastList === 0) {
       this.#violate(WRITE, "Contract violation: list_remixlets must succeed before write_remixlet.");
     }
-    if (this.#lastCapture <= this.#lastWrite) {
+    if (this.#captureOwedForWrite()) {
       this.#violate(WRITE, "Contract violation: capture_page must successfully capture the page before write_remixlet.");
     }
 
@@ -661,17 +954,21 @@ export class AgentContract {
     }
     // The evidence gate: no rewrite on a theory. After a failed post-activation
     // check, the fix must follow the recorded evidence — and when there is no
-    // evidence, the fix must create some.
-    if (this.#pendingFailureEvidence && !this.#failureLogsRead) {
+    // evidence, the fix must create some. The evidence is any log read since
+    // the activation the check is about (see #lastLogsRead), so a read made
+    // alongside the failing assert, or the lines a blocked assert carried, is
+    // not asked for twice.
+    const evidenceRead = this.#lastLogsRead > this.#lastWrite;
+    if (this.#pendingFailureEvidence && !evidenceRead) {
       this.#violate(
         WRITE,
-        "Contract violation: a post-activation check failed, but read_remixlet_logs has not run since that failure. Read the runtime logs now — the script's own recorded output is the evidence a fix must rest on — then write the corrected version in this same turn.",
+        "Contract violation: a post-activation check failed, and the runtime log has not been read since that activation. The script's own recorded output is the evidence a fix must rest on: call read_remixlet_logs now (a read made alongside the failing check would have counted, as would the log lines a blocked assert_page_state carries), then write the corrected version in this same turn.",
       );
     }
-    if (this.#pendingFailureEvidence && this.#failureLogsRead && this.#failureLogsEmpty && !writeCarriesLogging(params)) {
+    if (this.#pendingFailureEvidence && evidenceRead && this.#lastLogsEmpty && !writeCarriesLogging(params)) {
       this.#violate(
         WRITE,
-        "Contract violation: the logs since the failure are empty — the script recorded nothing about its own run, so there is no evidence to fix against. Make this write instrument first: add console.log/info calls at the script's key decisions (data arrived or didn't, mount attempted or skipped and why, element found or not), activate it, and read the logs before the next fix.",
+        "Contract violation: the log since the activation is empty — the script recorded nothing about its own run, so there is no evidence to fix against. Make this write instrument first: add console.log/info calls at the script's key decisions (data arrived or didn't, mount attempted or skipped and why, element found or not), activate it, and read the logs before the next fix.",
       );
     }
     if (this.#lastInspectDesign === 0 && writeIntroducesUi(params)) {
@@ -725,10 +1022,32 @@ export class AgentContract {
     }
     if (name === INSPECT_DESIGN) {
       this.#lastInspectDesign = sequence;
+      // The FIRST digest-mode read of the turn is the exemplar (the prompt's
+      // order: the host's control first, the insertion container second);
+      // targeted property reads are checks, not exemplar choices.
+      if (this.#lastInspectDesignSelector === undefined && params.properties === undefined && params.selector) {
+        this.#lastInspectDesignSelector = params.selector;
+      }
+      return;
+    }
+    if (name === LOOK) {
+      this.#lastLook = sequence;
+      return;
+    }
+    if (name === RECORD_LOOK) {
+      const verdict = lookVerdict(params);
+      // Every verdict is a recorded look, so the review obligation is paid;
+      // "wrong-kind" additionally owes a rebuild and a fresh look at it.
+      this.#pendingLookReview = false;
+      this.#pendingLookRebuild = verdict === "wrong-kind";
+      if (verdict === "differs") this.#lookDiffers += 1;
       return;
     }
     if (name === CAPTURE) {
       this.#lastCapture = sequence;
+      // SAFETY: tool details are JSON data returned by extension-owned tool implementations.
+      const details = output.details instanceof Object ? decodeCaptureDetails(output.details) : undefined;
+      this.#leftoverMarks = details?.leftovers ?? [];
       return;
     }
     if (name === LIST) {
@@ -751,10 +1070,9 @@ export class AgentContract {
       this.#lastWrite = sequence;
       this.#pendingVerification = true;
       // A successful write is a fresh activation: the evidence debt was paid
-      // (the gate let it through), and a new failure re-arms it afresh.
+      // (the gate let it through), and a new failure re-arms it afresh. Any
+      // earlier log read now sits before #lastWrite, so it no longer counts.
       this.#pendingFailureEvidence = false;
-      this.#failureLogsRead = false;
-      this.#failureLogsEmpty = false;
       // The agent authored the complete file set it just activated, so it now
       // holds current knowledge of this id — a follow-up write in the same
       // turn (e.g. fixing a failed verification) needs no ritual re-read.
@@ -764,7 +1082,14 @@ export class AgentContract {
       }
       this.#knownIds.add(target.id);
       this.#readCapabilities.set(target.id, new Set(target.capabilities));
-      if (writeIntroducesUi(params)) this.#pendingDesignAssertions = true;
+      // A UI-adding write owes the fit assertions and a look; so does the
+      // rebuild after a wrong-kind verdict, whatever its file pattern — the
+      // point of the rebuild is a control someone then looks at.
+      if (writeIntroducesUi(params) || this.#pendingLookRebuild) {
+        this.#pendingLookAssertions = true;
+        this.#pendingLookReview = true;
+      }
+      this.#pendingLookRebuild = false;
       this.#lastWriteFiles = writtenFiles(params);
       // Every write re-evaluates the both-states obligation from its complete
       // file set: a click-wired script owes the click → assert → click →
@@ -782,19 +1107,27 @@ export class AgentContract {
       return;
     }
     if (name === READ_LOGS) {
-      // Reading the evidence after a failure is exactly what the gate demands.
-      // details.count is the recorded-entry count the tool reports; 0 means
-      // the script logged nothing, which arms the instrument-first branch.
-      if (this.#pendingFailureEvidence) {
-        this.#failureLogsRead = true;
-        this.#failureLogsEmpty =
-          (output.details instanceof Object ? decodeLogDetails(output.details) : undefined)?.count === 0;
-      }
+      // Every read is recorded, failure pending or not: whether it counts as
+      // evidence is decided at the write gate by its order against the
+      // activation. details.count is the recorded-entry count the tool
+      // reports; 0 means the script logged nothing, which arms the
+      // instrument-first branch.
+      this.#recordLogsRead(
+        sequence,
+        (output.details instanceof Object ? decodeLogDetails(output.details) : undefined)?.count,
+      );
       return;
     }
     if (name === CLICK && sequence > this.#lastWrite && this.#pendingBothStates) {
       // A click advances the sequence only from "not yet clicked" states; the
-      // asserts in between are what make each click's effect count.
+      // asserts in between are what make each click's effect count. A click
+      // the page-side policy refused (off-site link, off-site form submit;
+      // wiki/ops/2026-09-12-security-review-plan.md F3) dispatched nothing, so
+      // it exercised no control and advances nothing: the tool succeeded, the
+      // click did not happen.
+      // SAFETY: tool details are JSON data returned by extension-owned tool implementations.
+      const details = output.details instanceof Object ? decodeClickDetails(output.details) : undefined;
+      if (details?.clicked === false) return;
       if (this.#bothStatesStage === 0 || this.#bothStatesStage === 2) this.#bothStatesStage += 1;
       return;
     }
@@ -805,14 +1138,14 @@ export class AgentContract {
       // obligation): a failing assert while probing an unmodified page is
       // information, not a failed check of the agent's own change.
       if (this.#lastWrite > 0 || this.#pendingVerification) {
-        if (details?.verificationSucceeded === true) {
-          this.#pendingFailureEvidence = false;
-          this.#failureLogsRead = false;
-          this.#failureLogsEmpty = false;
-        } else {
-          this.#pendingFailureEvidence = true;
-          this.#failureLogsRead = false;
-        }
+        this.#pendingFailureEvidence = details?.verificationSucceeded !== true;
+      }
+      // An assert whose result carried the runtime log lines (the observer-
+      // loop block appends the affected remixlets' newest entries) IS the log
+      // read: the model has the evidence in hand, and asking for a
+      // read_remixlet_logs that returns the same lines would be ritual.
+      if (details?.runtimeLogLinesShown !== undefined) {
+        this.#recordLogsRead(sequence, details.runtimeLogLinesShown);
       }
       if (details?.verificationBlockedByObserverLoop === true) {
         this.#pendingObserverRepair = true;
@@ -830,7 +1163,7 @@ export class AgentContract {
       }
       this.#pendingObserverRepair = false;
       this.#pendingVerification = false;
-      if (includesDesignAssertions(params)) this.#pendingDesignAssertions = false;
+      if (includesLookAssertions(params)) this.#pendingLookAssertions = false;
       if (this.#bothStatesStage === 1) {
         this.#bothStatesStage = 2;
       } else if (this.#bothStatesStage === 3) {
@@ -838,6 +1171,30 @@ export class AgentContract {
         this.#pendingBothStates = false;
       }
     }
+  }
+
+  #recordLogsRead(sequence: number, count: number | undefined): void {
+    this.#lastLogsRead = sequence;
+    this.#lastLogsEmpty = count === 0;
+  }
+
+  /**
+   * A verdict built on a leftover mark is refused: the capture already said
+   * the mark is not page data and will not survive a reload, so any evidence
+   * citing it describes a page that does not exist. The refusal names the
+   * mark and what to do instead; the model re-checks the rungs without it.
+   */
+  #assertEvidenceNotLeftover(params: ToolParams): void {
+    if (this.#leftoverMarks.length === 0) return;
+    const cited = citesLeftoverMark(params.evidence ?? "", this.#leftoverMarks);
+    if (cited === undefined) return;
+    this.#violate(
+      ASSESS,
+      `Refused: the evidence cites ${cited}, a mark a remixlet that is no longer installed left on this page (the ` +
+        `capture's "${LEFTOVER_SECTION_HEADING.replace(/^## /, "")}" section lists it). It is not page data and a reload ` +
+        "drops it. Re-check the rungs without it (element attributes and text, embedded state, page state, network) and " +
+        "record a verdict on what the page itself carries.",
+    );
   }
 
   #violate(tool: string, message: string, options?: { remediedByAskVerdict?: boolean }): never {
@@ -884,12 +1241,16 @@ function parseWriteTarget(params: ToolParams): WriteTarget {
 /**
  * The "introduces UI" heuristic: a static pattern over the write's submitted
  * JS file contents. Any of these DOM-building calls means the write mounts
- * something new on the page, so the design-inspection and design-verification
- * obligations attach. A false positive costs one cheap inspect_design that is
+ * something new on the page, so the design-inspection, fit-assertion and
+ * look-review obligations attach. A false positive costs one cheap inspect_design that is
  * beneficial anyway; pure-CSS restyles and dataset-tagging scripts never match
  * (wiki/raw/handoffs/design-inspection-enforcement.md).
  */
-const UI_WRITE_PATTERN = /createElement|insertAdjacentHTML|appendChild|prepend\(|innerHTML/;
+// Both spellings: the box's dom API (dom.create, clone, setHTML, append/
+// prepend/before/after, addStyle) and the raw DOM names, which still catch a
+// script that was written against the old world before the write is refused.
+const UI_WRITE_PATTERN =
+  /dom\.create\(|dom\.clone\(|\.clone\(|dom\.addStyle\(|\.setHTML\(|\.append\(|\.prepend\(|\.before\(|\.after\(|createElement|insertAdjacentHTML|appendChild|innerHTML/;
 
 function submittedFiles(params: { files?: unknown }): SubmittedFile[] {
   if (!Array.isArray(params.files)) return [];
@@ -917,7 +1278,7 @@ export function writeIntroducesUi(params: { files?: unknown }): boolean {
  * obligation attaches. A false positive costs one click_element round trip
  * that is beneficial anyway; reads and pure restyles never match.
  */
-const CLICK_HANDLER_PATTERN = /addEventListener\(\s*["'`]click["'`]|\.onclick\s*=/;
+const CLICK_HANDLER_PATTERN = /\.on\(\s*["'`]click["'`]|addEventListener\(\s*["'`]click["'`]|\.onclick\s*=/;
 
 export function writeWiresClickHandler(params: { files?: unknown }): boolean {
   return jsFilesMatch(params, CLICK_HANDLER_PATTERN);
@@ -995,14 +1356,60 @@ function specificExpectedValue(value: string): boolean {
 }
 
 /**
- * Whether an assert_page_state call carries the look-verifying assertion kinds
- * a UI-adding turn owes: at least one design-parity (the whole-look comparison
- * against a reference control) and one not-clipped. Read mechanically from the
- * params, the way assessedVerdict reads the verdict — never from prose.
+ * Whether an assert_page_state call carries the fit-checking assertion kinds
+ * a UI-adding turn owes: a visible and a not-clipped assertion (on the added
+ * control — the selector is the model's to choose). Read mechanically from
+ * the params, the way assessedVerdict reads the verdict — never from prose.
+ * Whether the control LOOKS right is the look review's question, not an
+ * assertion's (wiki/design/look-review.md).
  */
-function includesDesignAssertions(params: ToolParams): boolean {
+function includesLookAssertions(params: ToolParams): boolean {
   const conditions = new Set((params.assertions ?? []).flatMap((assertion) => (assertion.condition ? [assertion.condition] : [])));
-  return conditions.has("design-parity") && conditions.has("not-clipped");
+  return conditions.has("visible") && conditions.has("not-clipped");
+}
+
+const LOOK_VERDICTS = new Set(["matches", "differs", "wrong-kind", "not-reviewable"]);
+
+function lookVerdict(params: ToolParams): string {
+  const verdict = params.verdict;
+  if (verdict === undefined || !LOOK_VERDICTS.has(verdict)) {
+    throw new Error('Contract violation: record_look verdict must be "matches", "differs", "wrong-kind", or "not-reviewable".');
+  }
+  return verdict;
+}
+
+/**
+ * The construction lint's scan: declarations in the write's CSS files that
+ * set typography or colour to a LITERAL (not inherit/unset/currentColor, not
+ * a var(--token)) inside a rule whose selector targets the remixlet's own
+ * elements (the rmx- prefix the prompt mandates for added ids and classes).
+ * Rules on host elements are left alone — restyling the host is a legitimate
+ * feature; a lookalike built from literals is the smell. Comments are
+ * stripped first; nested at-rules are read through their outer braces.
+ */
+const TYPOGRAPHY_PROPERTIES = new Set(["font", "font-family", "font-size", "font-weight", "color", "line-height"]);
+
+export function hardcodedTypography(params: { files?: unknown }): string[] {
+  const findings: string[] = [];
+  for (const file of submittedFiles(params)) {
+    if (!file.path.endsWith(".css")) continue;
+    const css = file.content.replace(/\/\*[\s\S]*?\*\//g, "");
+    const rule = /([^{}]+)\{([^{}]*)\}/g;
+    for (let match = rule.exec(css); match !== null; match = rule.exec(css)) {
+      const selector = (match[1] ?? "").trim().split("}").pop()?.trim() ?? "";
+      if (!/rmx/i.test(selector) || selector.startsWith("@")) continue;
+      for (const declaration of (match[2] ?? "").split(";")) {
+        const colon = declaration.indexOf(":");
+        if (colon === -1) continue;
+        const property = declaration.slice(0, colon).trim().toLowerCase();
+        const value = declaration.slice(colon + 1).trim().replace(/\s*!important$/i, "");
+        if (!TYPOGRAPHY_PROPERTIES.has(property) || value.length === 0) continue;
+        if (/^(inherit|unset|initial|revert(-layer)?|currentcolor)$/i.test(value) || /^var\(/i.test(value)) continue;
+        if (findings.length < 6) findings.push(`${file.path} sets ${property}: ${value} on ${JSON.stringify(selector.slice(0, 80))}`);
+      }
+    }
+  }
+  return findings;
 }
 
 const ASSESS_VERDICTS = new Set([
@@ -1078,15 +1485,25 @@ function decodeWriteDetails(details: ToolDetails): WriteDetails {
   return { jsChanged: readBooleanProperty(details, "jsChanged") };
 }
 
+function decodeCaptureDetails(details: ToolDetails): CaptureDetails {
+  return { leftovers: readStringArrayProperty(details, "leftovers") };
+}
+
 function decodeLogDetails(details: ToolDetails): LogDetails {
   const count = readProperty(details, "count");
   return { count: Number.isFinite(count) ? Number(count) : undefined };
 }
 
+function decodeClickDetails(details: ToolDetails): ClickDetails {
+  return { clicked: readBooleanProperty(details, "clicked") };
+}
+
 function decodeVerificationDetails(details: ToolDetails): VerificationDetails {
+  const runtimeLogLinesShown = readProperty(details, "runtimeLogLinesShown");
   return {
     verificationBlockedByObserverLoop: readBooleanProperty(details, "verificationBlockedByObserverLoop"),
     observerFeedbackLoopRemixletIds: readStringArrayProperty(details, "observerFeedbackLoopRemixletIds"),
     verificationSucceeded: readBooleanProperty(details, "verificationSucceeded"),
+    runtimeLogLinesShown: Number.isFinite(runtimeLogLinesShown) ? Number(runtimeLogLinesShown) : undefined,
   };
 }

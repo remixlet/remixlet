@@ -5,7 +5,10 @@
 //
 // - a contract bounce (ContractViolationError, contracts.ts): the extension
 //   held the step until prerequisites ran — harness↔model choreography the
-//   model remedies within seconds; the user never needed to see it.
+//   model remedies on its own. The chat shows it as one calm, plain-words
+//   "held" row (panel/chat-phrases.tsx bouncePhrase): a bounce can cost a
+//   whole regeneration, so it has to be readable, but never as a red failure
+//   and never as the raw text.
 // - a safety-gate rejection (SafetyGateError): a pre-activation review sent
 //   the draft back; nothing was saved and the model writes a new version.
 // - a user decline (UserDeclinedError): the user chose not to allow the step;
@@ -39,7 +42,15 @@ export type ToolFailureKind = "bounced" | "gate" | "declined" | "error";
  * as something softer.
  */
 export function classifyToolFailure(text: string): ToolFailureKind {
-  if (text.includes("Contract violation:") || text.includes("has not been granted by the user")) return "bounced";
+  if (
+    text.includes("Contract violation:") ||
+    text.includes("has not been granted by the user") ||
+    // The leftover-mark refusal (contracts.ts #assertEvidenceNotLeftover) is
+    // a ContractViolationError whose text leads with "Refused:" instead.
+    text.startsWith("Refused: the evidence cites")
+  ) {
+    return "bounced";
+  }
   if (text.includes("nothing was saved or activated") || text.includes("(nothing was saved)")) return "gate";
   if (text.includes("The user declined")) return "declined";
   return "error";

@@ -12,16 +12,14 @@ import {
   AppWindow,
   ArrowLeft,
   ArrowUp,
+  Brain,
   Check,
   ChevronDown,
-  ChevronRight,
   History,
   Info,
-  Loader2,
   MessageSquarePlus,
   PenLine,
   Play,
-  Settings,
   ShieldCheck,
   SlidersHorizontal,
   Sparkles,
@@ -43,21 +41,28 @@ import {
 import { Response } from "@/components/ui/response";
 
 import {
+  catalogModel,
   ConversationSession,
   createAgentRuntime,
   endpointPlan,
   isContractNudgePrompt,
+  isFeaturedModel,
   ProviderTurnError,
   resumeVerificationPrompt,
+  supportedThinkingLevels,
   type AgentRuntime,
   type AgentRuntimeEvent,
   type AgentPromptOptions,
+  type ModelWaitEvent,
   type ProviderEndpoint,
   type SessionTranscriptItem,
+  type ThinkingLevel,
 } from "../agent/index.js";
 import type { PlatformCapabilities } from "../platform/capabilities.js";
 import { TabBinding, type BoundTab } from "./tab-binding.js";
+import { focusTab } from "../platform/active-tab.js";
 import { ext } from "../platform/ext.js";
+import { clearAskNotification, showAskNotification } from "../platform/notifications.js";
 import {
   DEFAULT_SETTINGS,
   SETTINGS_KEY,
@@ -66,10 +71,14 @@ import {
   providerRuntimeFingerprint,
   recordProviderOutcome,
   selectedProvider,
+  selectedThinkingLevel,
   settingsComplete,
+  thinkingLevelKey,
+  type AvailableModel,
   type ProviderSettings,
 } from "../shared/settings.js";
 import {
+  approvalDialogTitle,
   capabilityExplanation,
   capabilityGrantActionLabel,
   capabilityGrantFromPrompt,
@@ -96,15 +105,20 @@ import {
   type MessageKind,
   type ToolPhrase,
 } from "./chat-phrases.js";
-import { ScriptCode } from "./script-code.js";
+import { askNotificationCopy, panelViewFacts, shouldNotifyForAsk, type PendingAskKind } from "./ask-notifications.js";
+import { PermissionCard } from "./permission-card.js";
+import { DEV_OBSERVE_ICON, SCOPE_ICON, capabilityIcon } from "../shared/capability-icon.js";
 import { StartHere, useActivePage } from "./start-here.js";
+import { TurnStatus } from "./turn-status.js";
 import { SiteIcon } from "../ui/site-icon.js";
+import { ProviderLogo } from "../ui/provider-settings/provider-logo.js";
 import { groupByDay, timeFormat } from "../ui/control-center/day-groups.js";
+import { routeHash } from "../ui/control-center/router.js";
 import { explicitVerificationRecord } from "./verification.js";
+import { sanitizeLookReview } from "../shared/look-review.js";
 import type { ConversationMeta } from "../store/conversation-index.js";
 import type { RegistryEntry } from "../store/remixlet-store.js";
 import type { CapabilityApprovalProposal } from "../worker/activation.js";
-import { sanitizeModelTextForDisplay } from "../shared/safe-text.js";
 import {
   ANNOTATE_CLEAR_MESSAGE,
   ANNOTATION_RESULT_KIND,
@@ -157,25 +171,9 @@ interface QueuedPrompt {
   text: string;
 }
 
-// Trust the browser's framing boundary, not a page-controlled query string:
-// any embedded panel is the restricted drawer surface. Native sidebars,
-// extension tabs, and popup windows are top-level and retain full settings.
-const isDrawerSurface = window.top !== window;
-const requestedConversationId = new URLSearchParams(location.search).get("conversationId");
-const requestedDrawerTabIdText = new URLSearchParams(location.search).get("tabId");
-const requestedDrawerTabId = Number(requestedDrawerTabIdText);
-const drawerTabId =
-  isDrawerSurface && requestedDrawerTabIdText !== null && Number.isInteger(requestedDrawerTabId) && requestedDrawerTabId >= 0
-    ? requestedDrawerTabId
-    : undefined;
-const drawerConversationId =
-  isDrawerSurface && requestedConversationId && /^[A-Za-z0-9-]+$/.test(requestedConversationId)
-    ? requestedConversationId
-    : undefined;
-
 // Bounded auto-resume of an owed verification. When a conversation resumes on
 // top of an unverified activation (the verifying turn died with the runtime —
-// on the drawer surface the activation's tab reload destroys it), the panel
+// a panel closed or killed right after the activation's reload), the panel
 // drives a verify-or-fix continuation. Each attempt can itself trigger a fix
 // that re-activates and reloads, so the count must be DURABLE — it survives the
 // reload the way the in-memory obligation cannot. The cap turns "loop until it
@@ -229,21 +227,6 @@ function clearVerifyResumeCount(conversationId: string): void {
   void ext.storage.session.remove(verifyResumeKey(conversationId)).catch(() => {});
 }
 
-function rememberDrawerConversation(conversationId: string): void {
-  if (drawerTabId === undefined) return;
-  const url = new URL(location.href);
-  url.searchParams.set("conversationId", conversationId);
-  history.replaceState(null, "", url);
-  const key = `remixletDrawer:${drawerTabId}`;
-  void ext.storage.session.get(key).then((stored) => {
-    // SAFETY: drawer session state is written by the panel surface as this compact record.
-    const state = stored[key] as { windowId?: unknown } | undefined;
-    const windowId = Number(state?.windowId);
-    if (!Number.isInteger(windowId)) return;
-    return ext.storage.session.set({ [key]: { windowId, conversationId } });
-  });
-}
-
 // ---- settings ---------------------------------------------------------------
 
 async function loadSettings(): Promise<ProviderSettings> {
@@ -286,6 +269,21 @@ function modelSupportsImages(modelId: string): boolean {
   return /(gpt-4o|gpt-4\.1|gpt-4-turbo|gpt-5|chatgpt|^o[134](-|$))/i.test(modelId);
 }
 
+/** The pi catalog's display name for a model, falling back to the raw id. */
+function modelDisplayName(model: { providerKind: string; modelId: string }): string {
+  return catalogModel(model.providerKind, model.modelId)?.name ?? model.modelId;
+}
+
+// UI copy for pi's provider-neutral levels ("xhigh" is not a word).
+const THINKING_LEVEL_LABELS = {
+  minimal: "Minimal",
+  low: "Low",
+  medium: "Medium",
+  high: "High",
+  xhigh: "Extra high",
+  max: "Max",
+} satisfies Record<ThinkingLevel, string>;
+
 async function buildEndpoint(settings: ProviderSettings): Promise<ProviderEndpoint> {
   const provider = selectedProvider(settings);
   const selection = settings.selectedModel;
@@ -299,6 +297,7 @@ async function buildEndpoint(settings: ProviderSettings): Promise<ProviderEndpoi
       baseUrl: provider.baseUrl,
       modelId: selection.modelId,
       vision: true,
+      thinkingLevels: provider.modelThinking?.[selection.modelId]?.levels,
       getAccessToken: async () => {
         const reply = await sendToWorker({ kind: "codex.getAccessToken" }, "codex.accessToken");
         if (!reply.ok) throw new Error(reply.message);
@@ -343,12 +342,13 @@ export function App() {
   // never fires mouseleave — drop the hint so it can't stick.
   useEffect(() => setHoverHint(""), [running]);
   const [elapsedMs, setElapsedMs] = useState(0);
+  // The model call in flight, as the runtime last reported it (model_wait
+  // events; null between calls and while tools run). Drives the running
+  // indicator's words: a long quiet and each retry become visible instead of
+  // the spinner alone.
+  const [modelWait, setModelWait] = useState<ModelWaitEvent | null>(null);
   const [capabilities, setCapabilities] = useState<PlatformCapabilities | null>(null);
   const [approvalProposal, setApprovalProposal] = useState<CapabilityApprovalProposal | null>(null);
-  const [scriptApproval, setScriptApproval] = useState<{ code: string; host: string } | null>(null);
-  // The script dialog leads with plain words; the code itself is behind this
-  // disclosure for whoever wants to read it. Collapses again per request.
-  const [scriptCodeExpanded, setScriptCodeExpanded] = useState(false);
   // The end-of-turn capability ask (capability-request.ts): shown only once the
   // turn has settled, because mid-turn the agent may still find a cheaper rung.
   const [capabilityRequest, setCapabilityRequest] = useState<PendingCapabilityRequest | null>(null);
@@ -384,19 +384,31 @@ export function App() {
   // focus ring while the textarea has focus; the send button's enabled look
   // tracks whether there is anything to send (the textarea stays uncontrolled
   // — the conversation suite sets #input.value directly, so this state is a
-  // visual mirror, never the source of truth); the model menu expands inside
-  // the card below the toolbar.
+  // visual mirror, never the source of truth); the model and reasoning menus
+  // expand inside the card below the toolbar, one at a time.
   const [composerFocused, setComposerFocused] = useState(false);
   const [draftEmpty, setDraftEmpty] = useState(true);
-  const [modelMenuOpen, setModelMenuOpen] = useState(false);
+  const [composerMenu, setComposerMenu] = useState<"model" | "reasoning" | null>(null);
+  const [modelQuery, setModelQuery] = useState("");
+  const [allModelsOpen, setAllModelsOpen] = useState(false);
+  // Keyboard cursor over the menu's rows (models and the "All models"
+  // disclosure alike); focus itself stays on the search input throughout.
+  const [activeModelIndex, setActiveModelIndex] = useState(0);
 
   // Conversation↔tab binding mirrors (tab-binding.ts): the chip renders
   // boundTab; the blocking decision screen renders bindingIssue. The binding
   // itself lives in tabBindingRef below and is swapped with the session refs
   // on new/resume. Both kinds carry the site so the screen can reopen it.
   const [boundTab, setBoundTab] = useState<BoundTab | undefined>(undefined);
+  // "moved" carries `now` as well: the tab is still open and still bound, it
+  // is just showing somewhere else, and naming that somewhere is what makes
+  // the card readable ("now showing bank.com"). Empty when the tab is on a
+  // page with no site to name (a PDF, a browser page).
   const [bindingIssue, setBindingIssue] = useState<
-    { kind: "tab-closed"; siteKey: string } | { kind: "no-site-tab"; siteKey: string } | null
+    | { kind: "tab-closed"; siteKey: string }
+    | { kind: "no-site-tab"; siteKey: string }
+    | { kind: "moved"; siteKey: string; now: string }
+    | null
   >(null);
 
   const runtimeRef = useRef<AgentRuntime | undefined>(undefined);
@@ -424,7 +436,7 @@ export function App() {
   // One conversation at a time, persisted as sessions/<id>.jsonl. The history
   // menu swaps which one by pointing these refs at another id — the session
   // machinery (open → sanitized resume) is the same either way.
-  const conversationIdRef = useRef<string>(drawerConversationId ?? crypto.randomUUID());
+  const conversationIdRef = useRef<string>(crypto.randomUUID());
   // The tab this conversation's agent works on. Bound at the first message
   // (or resume), then fixed: tools resolve through it instead of "the active
   // tab", so the user can browse other tabs while a turn runs. Only an
@@ -440,24 +452,38 @@ export function App() {
         // source URL, so repeated binds on one site are a cheap no-op.
         if (bound && bound.siteKey) {
           void sendToWorker(
-            { kind: "siteIcon.record", siteKey: bound.siteKey, favIconUrl: bound.favIconUrl },
+            { kind: "siteIcon.record", siteKey: bound.siteKey, pageOrigin: bound.origin, favIconUrl: bound.favIconUrl },
             "siteIcon.recorded",
           ).catch(() => {});
         }
       },
       onLost: (previous) => setBindingIssue({ kind: "tab-closed", siteKey: previous.siteKey }),
+      // The bound tab is showing another site. Two things happen, and the
+      // order matters: the approval given for the page being LEFT is
+      // dropped first, then the card goes up. The dev-observe grant was
+      // pinned to one origin; it does not travel with the tab.
+      onMoved: (previous, now) => {
+        void sendToWorker(
+          { kind: "devObserve.disable", conversationId: conversationIdRef.current },
+          "devObserve.disabled",
+        ).catch(() => {});
+        setBindingIssue({ kind: "moved", siteKey: previous.siteKey, now });
+      },
+      // Back on the site under their own steam: the card comes down and tools
+      // resolve again. The grant dropped above stays dropped: it was
+      // answered about a page that has been replaced since.
+      onReturned: () => setBindingIssue((issue) => (issue?.kind === "moved" ? null : issue)),
     });
   }
   tabBindingRef.current ??= newTabBinding();
   const sessionRef = useRef<ConversationSession | undefined>(undefined);
   const indexedRef = useRef(false);
   const approvalResolverRef = useRef<((approved: boolean) => void) | null>(null);
-  const scriptApprovalResolverRef = useRef<((approved: boolean) => void) | null>(null);
-  // "Allow all" on the script dialog: later evaluate_js calls in the
-  // same conversation skip the dialog. Reset whenever the panel switches to a
-  // new or resumed conversation.
-  const scriptsAllowedForChatRef = useRef(false);
   const pendingVerificationRef = useRef<RegistryEntry | undefined>(undefined);
+  // What the latest look_at_change framed, so record_look's stored verdict
+  // names the control and whether a crop of it was stored.
+  const lookSubjectRef = useRef<string | undefined>(undefined);
+  const lookCropStoredRef = useRef(false);
   // The failed-exit evidence: the last post-activation assert_page_state that
   // did NOT pass, for the activation pendingVerificationRef still holds. When
   // a turn COMPLETES (not dies) with both refs set for the same remixlet, the
@@ -629,14 +655,8 @@ export function App() {
 
   // Grant-continuation and nudge prompts render back as action rows, never as
   // user bubbles — chat-phrases.ts owns that mapping; only the ids are local.
-  // Undefined rows (contract bounces the live chat also dropped) are skipped.
   function chatMessagesFromTranscript(items: SessionTranscriptItem[]): ChatMessage[] {
-    const messages: ChatMessage[] = [];
-    for (const item of items) {
-      const message = transcriptMessage(item);
-      if (message) messages.push({ id: ++nextIdRef.current, ...message });
-    }
-    return messages;
+    return items.map((item) => ({ id: ++nextIdRef.current, ...transcriptMessage(item) }));
   }
 
   function onAgentEvent(event: AgentRuntimeEvent): void {
@@ -698,6 +718,36 @@ export function App() {
         };
       }
     }
+    // The recorded look verdict (record_look) is stored beside the activated
+    // version's verification marker: the manager and popup show it as
+    // "Looked at it: …". Read from the tool's details (the contract added the
+    // reference it compared against), never from prose; the worker sanitizes
+    // it again at its boundary.
+    if (event.kind === "tool_end" && event.toolName === "record_look" && event.ok && appliedVersionRef.current) {
+      // SAFETY: successful record_look tool events carry the documented verdict details; sanitizeLookReview re-checks the shape.
+      const details = event.details as { verdict?: unknown; observed?: unknown; referenceSelector?: unknown; selector?: unknown } | undefined;
+      const review = sanitizeLookReview({
+        verdict: details?.verdict,
+        observed: details?.observed,
+        referenceSelector: details?.referenceSelector,
+        selector: lookSubjectRef.current,
+        reviewedAt: new Date().toISOString(),
+        hasCrop: lookCropStoredRef.current,
+      });
+      if (review) {
+        void sendToWorker(
+          { kind: "remixlet.recordLookReview", id: appliedVersionRef.current.id, review },
+          "remixlet.lookReviewRecorded",
+        ).catch((cause) => console.error("[remixlet] look review not recorded", cause));
+      }
+    }
+    if (event.kind === "tool_end" && event.toolName === "look_at_change" && event.ok) {
+      // SAFETY: successful look_at_change tool events carry the documented location details.
+      const details = event.details as { selector?: unknown; cropStored?: unknown } | undefined;
+      const selector = details?.selector;
+      lookSubjectRef.current = Object.prototype.toString.call(selector) === "[object String]" ? String(selector) : undefined;
+      lookCropStoredRef.current = details?.cropStored === true;
+    }
     const verification = explicitVerificationRecord(event, pendingVerificationRef.current, new Date().toISOString());
     if (verification) {
       pendingVerificationRef.current = undefined;
@@ -713,6 +763,20 @@ export function App() {
         },
         "remixlet.verificationRecorded",
       ).catch((cause) => console.error("[remixlet] verification marker not recorded", cause));
+    }
+    if (event.kind === "model_wait") {
+      setModelWait(event.phase === "done" ? null : event);
+      if (event.phase === "retrying") {
+        // The attempt that streamed these words was given up; the next one
+        // answers from scratch, so its bubble and working notes go too.
+        const abandoned = [streamingIdRef.current, thinkingIdRef.current].filter((id): id is number => id !== null);
+        streamingIdRef.current = null;
+        thinkingIdRef.current = null;
+        if (abandoned.length > 0) setMessages((prev) => prev.filter((m) => !abandoned.includes(m.id)));
+      }
+      // Progress ticks arrive between working-notes deltas and must not split
+      // that row — return before the row-ending rule below.
+      return;
     }
     // A non-thinking event ends the current working-notes row: the next burst
     // of notes (after a tool call or an answer) starts a fresh row.
@@ -759,15 +823,10 @@ export function App() {
         const tracked = toolMsgRef.current.get(event.toolCallId);
         toolMsgRef.current.delete(event.toolCallId);
         const phrase = tracked?.phrase ?? describeTool(event.toolName, undefined);
+        // A contract bounce settles too: the in-flight row becomes the
+        // plain-words "held" line (chat-phrases.tsx bouncePhrase) so the
+        // user can read that the step waited and why.
         const settled = settledToolMessage(event.toolName, phrase, event);
-        if (!settled) {
-          // A contract bounce: the extension held the step until its
-          // prerequisites ran, and the agent redoes it within seconds. Drop
-          // the in-flight row so the user sees the corrected order, not a
-          // false start that reads as breakage.
-          if (tracked) setMessages((prev) => prev.filter((m) => m.id !== tracked.id));
-          break;
-        }
         if (tracked) {
           setMessages((prev) =>
             prev.map((m) => (m.id === tracked.id ? { ...m, text: settled.text, icon: settled.icon, state: settled.state } : m)),
@@ -795,8 +854,17 @@ export function App() {
     const authorized = unspentGrantRef.current;
     // A changed network-rules file must always be SHOWN (item 9), never folded
     // into the one-click auto-approval — the click authorized capability names,
-    // not a rewrite of what the rules do.
-    if (!proposal.broadScope && !proposal.netRulesChanged && authorized && proposal.added.length > 0 && proposal.added.every((capability) => authorized.has(capability))) {
+    // not a rewrite of what the rules do. Neither is a scope outside the site
+    // this chat is bound to: the click was made on one site, and authorizes
+    // nothing on another.
+    if (
+      !proposal.broadScope &&
+      !proposal.netRulesChanged &&
+      !proposal.offSite &&
+      authorized &&
+      proposal.added.length > 0 &&
+      proposal.added.every((capability) => authorized.has(capability))
+    ) {
       addMessage("tool", `Gave "${proposal.remixletName}" the access you allowed`, ShieldCheck);
       const removalNote = capabilityRemovalNote(proposal.removed);
       if (removalNote) addMessage("tool", removalNote, ShieldCheck);
@@ -818,28 +886,6 @@ export function App() {
     resolve?.(approved);
   }
 
-  // The evaluate_js escape-hatch gate: the script runs only after the user
-  // approves it (the exact code is one disclosure click away). Per-call,
-  // mirroring the capability-approval resolver pattern above — unless the
-  // user already chose "Allow all" in this conversation.
-  function confirmScriptEvaluation(request: { code: string; host: string }): Promise<boolean> {
-    if (scriptsAllowedForChatRef.current) return Promise.resolve(true);
-    scriptApprovalResolverRef.current?.(false);
-    setScriptCodeExpanded(false);
-    setScriptApproval(request);
-    return new Promise((resolve) => {
-      scriptApprovalResolverRef.current = resolve;
-    });
-  }
-
-  function resolveScriptEvaluation(decision: "deny" | "once" | "chat"): void {
-    if (decision === "chat") scriptsAllowedForChatRef.current = true;
-    const resolve = scriptApprovalResolverRef.current;
-    scriptApprovalResolverRef.current = null;
-    setScriptApproval(null);
-    resolve?.(decision !== "deny");
-  }
-
   async function ensureRuntime(): Promise<AgentRuntime> {
     if (runtimeRef.current) return runtimeRef.current;
     const settings = await loadSettings();
@@ -858,11 +904,14 @@ export function App() {
       textVerbosity: codexTextVerbosity(chatPrefs.verbosity),
       endpoint: await buildEndpoint(settings),
       tools: buildTools(
-        { confirmCapabilityApproval, confirmScriptEvaluation },
+        { confirmCapabilityApproval },
         conversationIdRef.current,
         tabBindingRef.current!,
+        // The look review stores its crop beside the remixlet this turn
+        // activated (the divider's entry, held until the turn ends).
+        { activatedRemixletId: () => appliedVersionRef.current?.id },
       ),
-      maxRetries: 2,
+      thinkingLevel: selectedThinkingLevel(settings),
       session,
     });
     runtime.subscribe(onAgentEvent);
@@ -905,13 +954,12 @@ export function App() {
     releaseDevObserveGrant(conversationIdRef.current);
     const conversationId = crypto.randomUUID();
     conversationIdRef.current = conversationId;
-    rememberDrawerConversation(conversationId);
     // A fresh conversation gets a fresh binding: it binds at the first
-    // message — except on the drawer surface, which is pinned to its host tab.
+    // message. Dispose the outgoing one so its navigation watch stops.
+    tabBindingRef.current?.dispose();
     tabBindingRef.current = newTabBinding();
     setBoundTab(undefined);
     setBindingIssue(null);
-    if (drawerTabId !== undefined) void tabBindingRef.current.bindTab(drawerTabId);
     sessionRef.current = undefined;
     runtimeRef.current = undefined;
     indexedRef.current = false;
@@ -922,7 +970,6 @@ export function App() {
     unspentGrantRef.current = null;
     pendingVerificationRef.current = undefined;
     failedVerificationRef.current = undefined;
-    scriptsAllowedForChatRef.current = false;
     replaceQueuedPrompts([]);
     setStatusText("");
     setView("chat");
@@ -939,22 +986,17 @@ export function App() {
         // make the worker agree rather than leaving a readable buffer behind.
         void sendToWorker({ kind: "devObserve.disable", conversationId: meta.id }, "devObserve.disabled").catch(() => {});
         conversationIdRef.current = meta.id;
-        rememberDrawerConversation(meta.id);
         // Site-aware rebind: the resumed conversation must never silently
         // operate on a wrong-site tab. Current tab if it matches the
         // conversation's site, else any open tab on the site, else unbound
-        // with the card offering an explicit choice. The drawer stays pinned
-        // to its host tab.
+        // with the card offering an explicit choice.
+        tabBindingRef.current?.dispose();
         tabBindingRef.current = newTabBinding();
         setBoundTab(undefined);
         setBindingIssue(null);
-        if (drawerTabId !== undefined) {
-          void tabBindingRef.current.bindTab(drawerTabId);
-        } else {
-          void tabBindingRef.current.bindForResume(meta.siteKey).then((outcome) => {
-            if (outcome === "no-site-tab") setBindingIssue({ kind: "no-site-tab", siteKey: meta.siteKey });
-          });
-        }
+        void tabBindingRef.current.bindForResume(meta.siteKey).then((outcome) => {
+          if (outcome === "no-site-tab") setBindingIssue({ kind: "no-site-tab", siteKey: meta.siteKey });
+        });
         sessionRef.current = session;
         runtimeRef.current = undefined; // next turn binds the runtime to this session
         indexedRef.current = true; // it's already in the index
@@ -962,7 +1004,6 @@ export function App() {
         setCapabilityRequest(null);
         pendingCapabilityRequestRef.current = undefined;
         unspentGrantRef.current = null;
-        scriptsAllowedForChatRef.current = false;
         setMessages(chatMessagesFromTranscript(session.transcriptItems()));
         setCurrentVersions({});
         setStatusText("");
@@ -1067,9 +1108,22 @@ export function App() {
   // The rebind card's primary action when no open tab is on the chat's site:
   // open the site and bind the new tab in one click. Conversation site keys
   // are single hostnames (siteKeyForUrl), so `https://host/` is the site root.
+  // The card's primary action. An already-open tab on the site is preferred
+  // over a new one, and the tab the user moved elsewhere is never navigated
+  // back: they are using it for something, and taking it away to repair a
+  // binding would be the second thing today that moved a page out from under
+  // them. bindForResume owns the "current tab, else any site tab" search.
   function openSiteAndBind(siteKey: string): void {
-    void ext.tabs.create({ url: `https://${siteKey}/` }).then((tab) => {
-      if (tab.id !== undefined) void tabBindingRef.current!.bindTab(tab.id, siteKey);
+    const binding = tabBindingRef.current;
+    if (!binding) return;
+    void binding.bindForResume(siteKey).then((outcome) => {
+      if (outcome === "bound") {
+        setBindingIssue(null);
+        return;
+      }
+      void ext.tabs.create({ url: `https://${siteKey}/` }).then((tab) => {
+        if (tab.id !== undefined) void binding.bindTab(tab.id, siteKey);
+      });
     });
   }
 
@@ -1077,12 +1131,23 @@ export function App() {
     void ext.tabs.create({ url: ext.runtime.getURL("manager.html") });
   }
 
-  function openOnboarding(): void {
-    void ext.tabs.create({ url: ext.runtime.getURL("welcome.html") });
+  // The "Working on" label brings the bound tab back into view — the panel
+  // follows the user across tabs, so the page a chat works on is often not
+  // the one they are looking at.
+  function showBoundTab(): void {
+    if (!boundTab) return;
+    void focusTab(boundTab.tabId);
   }
 
   function openSecureSettings(): void {
     void ext.tabs.create({ url: ext.runtime.getURL("manager.html#/settings/providers") });
+  }
+
+  // The version divider's "vN" opens that remixlet's page in the control
+  // center — its version history, diffs, and code — in a new tab, the same
+  // way every other manager link from the panel opens.
+  function openRemixletPage(remixletId: string): void {
+    void ext.tabs.create({ url: ext.runtime.getURL(`manager.html${routeHash({ kind: "remixlet", id: remixletId })}`) });
   }
 
   function indexFirstPrompt(text: string): void {
@@ -1116,10 +1181,9 @@ export function App() {
     if (!runningRef.current || stopRequestedRef.current) return;
     stopRequestedRef.current = true;
     setStatusText("Stopping…");
-    // A capability or script prompt is part of the current turn. Resolve them
-    // before aborting so no tool remains suspended behind a modal.
+    // A capability prompt is part of the current turn. Resolve it before
+    // aborting so no tool remains suspended behind a modal.
     resolveCapabilityApproval(false);
-    resolveScriptEvaluation("deny");
     runtimeRef.current?.abort();
   }
 
@@ -1231,6 +1295,7 @@ export function App() {
           failedVerificationRef.current = undefined;
           streamingIdRef.current = null;
           thinkingIdRef.current = null;
+          setModelWait(null);
           toolMsgRef.current.clear();
           // The exchange is over one way or another; if it activated a
           // version, close it with the divider (a stopped or errored turn
@@ -1386,7 +1451,7 @@ export function App() {
   }
 
   // The overlay broadcasts its result to every extension context; the panel is
-  // the consumer of the payload (the worker only restores the drawer).
+  // the consumer of the payload (the worker only acknowledges the broadcast).
   useEffect(() => {
     const onRuntimeMessage = (message: AnnotationResultPayload | { kind?: string }, sender: { tab?: { id?: number } }): undefined => {
       if (!isAnnotationResultMessage(message)) return;
@@ -1410,12 +1475,27 @@ export function App() {
 
   // ---- model selection -------------------------------------------------------
 
+  const modelMenuOpen = composerMenu === "model";
+  const reasoningMenuOpen = composerMenu === "reasoning";
+
+  // Closing hands focus back to the trigger: the menu owned it (the search
+  // input, or a level row), and it unmounts with the menu.
+  function closeModelMenu(): void {
+    setComposerMenu(null);
+    document.getElementById("chat-model")?.focus();
+  }
+
+  function closeReasoningMenu(): void {
+    setComposerMenu(null);
+    document.getElementById("chat-reasoning")?.focus();
+  }
+
   function selectModel(selection: NonNullable<ProviderSettings["selectedModel"]>): void {
     const previous = providerSettings.selectedModel;
     const next = { ...providerSettings, selectedModel: { providerId: selection.providerId, modelId: selection.modelId } };
     setProviderSettings(next);
     setProviderReady(settingsComplete(next));
-    setModelMenuOpen(false);
+    closeModelMenu();
     runtimeRef.current = undefined;
     runtimeProviderKindRef.current = undefined;
     runtimeProviderIdRef.current = undefined;
@@ -1425,6 +1505,25 @@ export function App() {
     if (previous && (previous.providerId !== selection.providerId || previous.modelId !== selection.modelId)) {
       addNotice(`Model changed to ${selection.modelId}`);
     }
+    void saveSettings(next);
+  }
+
+  // The chosen level is baked into the runtime (pi's thinkingLevel), so like
+  // a verbosity change this rebuilds on the next turn; the transcript stays
+  // silent — the author doesn't change, only how long it thinks.
+  function selectThinkingLevel(level: ThinkingLevel | undefined): void {
+    const selection = providerSettings.selectedModel;
+    if (!selection) return;
+    const key = thinkingLevelKey(selection);
+    const levels = { ...providerSettings.thinkingLevels };
+    if (level === undefined) delete levels[key];
+    else levels[key] = level;
+    const next: ProviderSettings = { ...providerSettings };
+    delete next.thinkingLevels;
+    if (Object.keys(levels).length > 0) next.thinkingLevels = levels;
+    setProviderSettings(next);
+    closeReasoningMenu();
+    runtimeRef.current = undefined;
     void saveSettings(next);
   }
 
@@ -1459,10 +1558,6 @@ export function App() {
       }
     };
     ext.storage.onChanged.addListener(onStorageChanged);
-    // The drawer surface arrives pinned to its host tab — bind immediately so
-    // the chip shows the target from the first paint. Other surfaces bind at
-    // the first message instead.
-    if (drawerTabId !== undefined) void tabBindingRef.current?.bindTab(drawerTabId);
     void loadChatPreferences().then((prefs) => {
       chatPrefsRef.current = prefs;
     });
@@ -1472,27 +1567,60 @@ export function App() {
       setProviderReady(settingsComplete(settings));
       const reply = await sendToWorker({ kind: "capabilities.get" }, "capabilities.result");
       setCapabilities(reply.capabilities);
-      if (drawerConversationId) {
-        const session = await ConversationSession.open(drawerConversationId);
-        conversationIdRef.current = drawerConversationId;
-        sessionRef.current = session;
-        runtimeRef.current = undefined;
-        indexedRef.current = session.transcriptItems().length > 0;
-        setMessages(chatMessagesFromTranscript(session.transcriptItems()));
-        setCurrentVersions({});
-        maybeResumeVerification(session);
-      }
       document.body.dataset.rmxTurn = "idle";
     })();
     return () => {
       ext.storage.onChanged.removeListener(onStorageChanged);
       approvalResolverRef.current?.(false);
       approvalResolverRef.current = null;
-      scriptApprovalResolverRef.current?.(false);
-      scriptApprovalResolverRef.current = null;
       runtimeRef.current?.abort();
     };
   }, []);
+
+  // ---- ask notification (ask-notifications.ts) -------------------------------
+  //
+  // Whichever ask is waiting on the user right now, in the order the surfaces
+  // stack: the modal dialogs cover the cards. Null while nothing waits.
+  const pendingAsk: PendingAskKind | null = approvalProposal
+    ? "capability-approval"
+    : capabilityRequest
+      ? "capability-request"
+      : devObserveRequest
+        ? "dev-observe-request"
+        : null;
+  const askTabId = boundTab?.tabId;
+  const askHost = hostOf(boundTab?.origin);
+  useEffect(() => {
+    if (!pendingAsk || askTabId === undefined || !chatPrefsRef.current.askNotifications) return;
+    // The view check is async, so the ask can resolve before it lands: the
+    // cancelled flag stops a late create, and the clear on cleanup chains
+    // behind any create still in flight so it never runs first.
+    let cancelled = false;
+    let shown: Promise<void> = Promise.resolve();
+    const copy = askNotificationCopy(pendingAsk, askHost);
+    const clear = (): void => {
+      void shown.then(() => clearAskNotification(askTabId)).catch(() => {});
+    };
+    void panelViewFacts().then((facts) => {
+      if (cancelled || !shouldNotifyForAsk({ enabled: true, ...facts })) return;
+      shown = showAskNotification(askTabId, copy.title, copy.message).catch(() => {});
+    });
+    // Coming back by any route (not only the toast's click, which the worker
+    // clears itself) takes the toast down: the ask is on screen again.
+    const onSeen = (): void => {
+      void panelViewFacts().then((facts) => {
+        if (!cancelled && !facts.hidden && facts.windowFocused) clear();
+      });
+    };
+    document.addEventListener("visibilitychange", onSeen);
+    window.addEventListener("focus", onSeen);
+    return () => {
+      cancelled = true;
+      document.removeEventListener("visibilitychange", onSeen);
+      window.removeEventListener("focus", onSeen);
+      clear();
+    };
+  }, [pendingAsk, askTabId, askHost]);
 
   // Elapsed-time ticker for the running indicator at the bottom of the chat.
   useEffect(() => {
@@ -1506,10 +1634,143 @@ export function App() {
     return () => clearInterval(id);
   }, [running]);
 
+  // The composer menus dismiss on any pointer press outside themselves and
+  // their triggers — pressing the textarea, the transcript, or anywhere else
+  // means "never mind". Pointer only: focus keeps moving freely (the search
+  // input owns it while the model menu is open) and Escape already covers
+  // the keyboard.
+  useEffect(() => {
+    if (composerMenu === null) return;
+    const onPointerDown = (event: PointerEvent): void => {
+      const target = event.target;
+      if (!(target instanceof Node)) return;
+      const inside = ["model-menu", "reasoning-menu", "chat-model", "chat-reasoning"].some((id) =>
+        document.getElementById(id)?.contains(target),
+      );
+      if (!inside) setComposerMenu(null);
+    };
+    document.addEventListener("pointerdown", onPointerDown);
+    return () => document.removeEventListener("pointerdown", onPointerDown);
+  }, [composerMenu]);
+
+  // The reasoning menu is a radiogroup with roving focus: opening moves
+  // focus onto the effective row so the arrow keys work immediately.
+  useEffect(() => {
+    if (composerMenu !== "reasoning") return;
+    const menu = document.getElementById("reasoning-menu");
+    const checked = menu?.querySelector<HTMLButtonElement>('[aria-checked="true"]');
+    (checked ?? menu?.querySelector<HTMLButtonElement>('[role="radio"]'))?.focus();
+  }, [composerMenu]);
+
   // ---- view -------------------------------------------------------------------
 
   const boundHost = boundTab?.siteKey ?? "";
   const modelOptions = availableModels(providerSettings);
+  // The picker's two tiers: featured (pi's curated catalog knows the model, or
+  // the provider kind has no catalog to judge by) up front, everything else the
+  // credential can see behind the "All models" disclosure. A split needs two
+  // non-empty tiers — when either side is empty the list renders flat. Typing
+  // in the search box replaces the tiers with one flat filtered list, so a
+  // model pi doesn't know yet is always reachable by name.
+  const providerModelIds = (providerId: string): readonly string[] =>
+    providerSettings.providers.find((provider) => provider.id === providerId)?.models ?? [];
+  const featuredModels = modelOptions.filter((model) =>
+    isFeaturedModel(model.providerKind, model.modelId, providerModelIds(model.providerId)),
+  );
+  const extraModels = modelOptions.filter(
+    (model) => !isFeaturedModel(model.providerKind, model.modelId, providerModelIds(model.providerId)),
+  );
+  const modelTiersSplit = featuredModels.length > 0 && extraModels.length > 0;
+  const modelFilter = modelQuery.trim().toLowerCase();
+  // Filtered results run featured-first, so the top hit (what Enter selects)
+  // is a curated model whenever one matches. The haystack carries the pi
+  // catalog's display name alongside the raw id, so both spellings match.
+  const filteredModels = modelFilter
+    ? [...featuredModels, ...extraModels].filter((model) =>
+        `${model.modelId} ${modelDisplayName(model)} ${model.providerName}`.toLowerCase().includes(modelFilter),
+      )
+    : null;
+  // Every row the keyboard cursor can land on, in render order: the "All
+  // models" disclosure is a navigable item like the models around it, so
+  // arrows reach it and Enter toggles it without leaving the search input.
+  const modelMenuItems: ({ kind: "model"; model: AvailableModel } | { kind: "all-models" })[] = filteredModels
+    ? filteredModels.map((model) => ({ kind: "model", model }))
+    : [
+        ...(modelTiersSplit ? featuredModels : modelOptions).map((model) => ({ kind: "model" as const, model })),
+        ...(modelTiersSplit ? [{ kind: "all-models" as const }] : []),
+        ...(modelTiersSplit && allModelsOpen ? extraModels.map((model) => ({ kind: "model" as const, model })) : []),
+      ];
+  // The cursor state survives list reshapes (typing, toggling the disclosure);
+  // clamp rather than reset so it never points past the end.
+  const activeModelPos = Math.min(activeModelIndex, Math.max(0, modelMenuItems.length - 1));
+  const modelOptionId = (index: number): string =>
+    modelMenuItems[index]?.kind === "all-models" ? "all-models" : `model-option-${index}`;
+  const openModelMenu = (): void => {
+    setModelQuery("");
+    setActiveModelIndex(0);
+    // The disclosure starts open when the current selection lives behind it,
+    // so its checkmark is visible on open.
+    const selected = selectedProvider(providerSettings);
+    setAllModelsOpen(
+      selected !== undefined &&
+        providerSettings.selectedModel !== null &&
+        !isFeaturedModel(selected.kind, providerSettings.selectedModel.modelId, selected.models),
+    );
+    setComposerMenu("model");
+  };
+  const modelRow = (model: AvailableModel, index: number) => {
+    const current =
+      providerSettings.selectedModel?.providerId === model.providerId &&
+      providerSettings.selectedModel?.modelId === model.modelId;
+    const name = modelDisplayName(model);
+    return (
+      <button
+        key={`${model.providerId}:${model.modelId}`}
+        id={`model-option-${index}`}
+        type="button"
+        role="option"
+        aria-selected={current}
+        tabIndex={-1}
+        className={`flex shrink-0 items-center justify-between gap-2 rounded-[7px] px-2 py-[7px] text-left ${
+          index === activeModelPos ? "bg-foreground/7" : ""
+        }`}
+        onMouseEnter={() => setActiveModelIndex(index)}
+        onClick={() => selectModel(model)}
+      >
+        <span className="flex min-w-0 flex-col gap-px">
+          <span className="truncate text-[12.5px] text-foreground">{name}</span>
+          <span className="truncate text-[11px] text-muted-foreground">
+            {/* The raw id rides along whenever the display name replaced it —
+                it's what error messages and the transcript notice cite. */}
+            {name === model.modelId ? model.providerName : `${model.providerName} · ${model.modelId}`}
+          </span>
+        </span>
+        {current && <Check className="size-[13px] shrink-0 text-primary" strokeWidth={2.4} aria-hidden />}
+      </button>
+    );
+  };
+  // The selected model's reasoning dial: which levels it takes (declared by
+  // its provider, or derived from the pi catalog), the user's stored choice,
+  // and the backend default that carries the "Default" badge. Empty ⇒ the
+  // model has no dial and the reasoning control disappears with it — the
+  // control exists exactly when it means something.
+  const thinkingProvider = selectedProvider(providerSettings);
+  const thinkingModelId = providerSettings.selectedModel?.modelId;
+  const thinkingDeclared = thinkingModelId ? thinkingProvider?.modelThinking?.[thinkingModelId] : undefined;
+  const thinkingOptions =
+    thinkingProvider && thinkingModelId
+      ? supportedThinkingLevels(thinkingProvider.kind, thinkingModelId, thinkingDeclared?.levels)
+      : [];
+  const chosenThinkingLevel = selectedThinkingLevel(providerSettings);
+  // What the trigger reads: a stored override by name, else the provider's
+  // declared default by name, else the word "Default" — no override stored
+  // means the backend decides, and the label says so in words.
+  const reasoningTriggerLabel =
+    chosenThinkingLevel !== undefined
+      ? THINKING_LEVEL_LABELS[chosenThinkingLevel]
+      : thinkingDeclared?.defaultLevel !== undefined
+        ? THINKING_LEVEL_LABELS[thinkingDeclared.defaultLevel]
+        : "Default";
   const composerHasContent = !draftEmpty || pendingAnnotation !== null;
   // A fresh, unbound chat while the user is on a browser or extension page:
   // there is no page a first message could work on, so the composer refuses to
@@ -1524,7 +1785,6 @@ export function App() {
   // cap and the pencil toggle flip together.
   const capText =
     hoverHint || statusText || (annotating ? "Markup is on — draw on the page, then press Done there" : "");
-
   // Hover/focus handlers standing in for a native title tooltip. Activating
   // the control clears the hint (capture phase, so it composes with the
   // button's own onClick) — the action's resulting status should show, not
@@ -1547,48 +1807,62 @@ export function App() {
           aria-modal="true"
           aria-labelledby="capability-approval-title"
         >
-          <div className="w-full rounded-xl border bg-background p-4 shadow-xl">
+          {/* One raised surface and no lines: the panel is bg-secondary with a
+              shadow, no border, and the rows inside are plain text marked by an
+              icon rather than boxed (wiki/design/permission-copy.md, "Dialog
+              layout"). */}
+          <div className="w-full rounded-xl bg-secondary p-4 shadow-xl">
             <h2 id="capability-approval-title" className="text-sm font-semibold">
-              Allow more access?
+              {approvalDialogTitle(approvalProposal)}
             </h2>
-            <p className="mt-1 text-xs text-muted-foreground">
-              “{approvalProposal.remixletName}” is asking for more access. Nothing changes unless you allow it.
-            </p>
-            {/* Scope card, ABOVE the capability list. The copy is panel-authored
-                (scopeExplanation) from the manifest's own matches/siteKey —
-                never model prose — so a remixlet cannot describe its own reach. */}
-            {(() => {
-              const scope = scopeExplanation(approvalProposal.matches, approvalProposal.siteKey);
-              return (
-                <div id="capability-approval-scope" className="mt-3 rounded-lg border p-2">
-                  <p className="text-xs font-semibold">{scope.title}</p>
-                  <p className="mt-0.5 text-xs text-muted-foreground">{scope.detail}</p>
-                </div>
-              );
-            })()}
-            <ul className="mt-2 flex flex-col gap-2">
-              {approvalProposal.added.map((capability) => {
-                const copy = capabilityExplanation(capability);
-                // The extension's own honest sentence ALWAYS renders (H2). The
-                // remixlet's rationale, if any, shows only as an attributed,
-                // subordinate line with control/bidi characters stripped and a
-                // hard length cap — it can never replace copy.detail.
-                const says = sanitizeModelTextForDisplay(approvalProposal.rationales[capability] ?? "");
+            <ul className="mt-3.5 flex flex-col gap-3.5">
+              {/* Scope row, ABOVE the capability rows. The copy is panel-authored
+                  (scopeExplanation) from the manifest's own matches/siteKey —
+                  never model prose — so a remixlet cannot describe its own reach. */}
+              {(() => {
+                const scope = scopeExplanation(approvalProposal.matches, approvalProposal.siteKey);
                 return (
-                  <li key={capability} className="rounded-lg border p-2">
-                    <p className="text-xs font-semibold">{copy.title}</p>
-                    <p className="mt-0.5 text-xs text-muted-foreground">{copy.detail}</p>
-                    {says && (
-                      <p className="mt-1 text-[11px] italic text-muted-foreground/80">The remixlet says: “{says}”</p>
-                    )}
+                  <li id="capability-approval-scope" className="flex items-start gap-2.5">
+                    <SCOPE_ICON className="mt-px size-4 shrink-0 text-muted-foreground" aria-hidden />
+                    <div className="min-w-0">
+                      <p className="text-[13px] leading-[18px] font-medium">{scope.title}</p>
+                      <p className="mt-0.5 text-xs text-muted-foreground">{scope.detail}</p>
+                    </div>
+                  </li>
+                );
+              })()}
+              {approvalProposal.added.map((capability) => {
+                // Extension-authored copy only (H2): the manifest's rationale
+                // stays in the approval record and never renders here — the
+                // chat has already said why the agent is asking.
+                const copy = capabilityExplanation(capability);
+                const Icon = capabilityIcon(capability);
+                return (
+                  <li key={capability} className="flex items-start gap-2.5">
+                    <Icon className="mt-px size-4 shrink-0 text-muted-foreground" aria-hidden />
+                    <div className="min-w-0">
+                      <p className="text-[13px] leading-[18px] font-medium">{copy.title}</p>
+                      <p className="mt-0.5 text-xs text-muted-foreground">{copy.detail}</p>
+                    </div>
                   </li>
                 );
               })}
             </ul>
+            {approvalProposal.offSite && (
+              // The site term (remediation plan item 7): the code would run
+              // outside the site this chat is bound to, or the request has no
+              // page binding at all. Panel-authored, never model prose; the
+              // scope card above names every host.
+              <p id="capability-approval-off-site" className="mt-3.5 text-xs text-muted-foreground">
+                {approvalProposal.authorizedSite
+                  ? `This chat is working on ${approvalProposal.authorizedSite}, but the remixlet would run on sites outside it.`
+                  : "This request is not tied to a page you are working on, so the sites it runs on need your approval."}
+              </p>
+            )}
             {approvalProposal.netRulesChanged && (
               // Item 9: a netrules remixlet whose rules file content changed
               // versus what was approved. Panel-authored, never model prose.
-              <p id="capability-approval-netrules-changed" className="mt-2 text-xs text-muted-foreground">
+              <p id="capability-approval-netrules-changed" className="mt-3.5 text-xs text-muted-foreground">
                 Its network rules — what it blocks, redirects, or changes — are different from the ones you approved before.
               </p>
             )}
@@ -1596,12 +1870,12 @@ export function App() {
               // The replacement half of a capability swap: this activation
               // durably drops these grants, and saying so is what keeps the
               // ask from reading as ever-growing access.
-              <p id="capability-approval-removed" className="mt-2 text-xs text-muted-foreground">
+              <p id="capability-approval-removed" className="mt-3.5 text-xs text-muted-foreground">
                 {capabilityRemovalNote(approvalProposal.removed)}
               </p>
             )}
             <div className="mt-4 flex justify-end gap-2">
-              <Button id="capability-deny" type="button" variant="outline" onClick={() => resolveCapabilityApproval(false)}>
+              <Button id="capability-deny" type="button" variant="ghost" onClick={() => resolveCapabilityApproval(false)}>
                 Don’t allow
               </Button>
               <Button id="capability-approve" type="button" onClick={() => resolveCapabilityApproval(true)}>
@@ -1611,59 +1885,10 @@ export function App() {
           </div>
         </div>
       )}
-      {scriptApproval && (
-        <div
-          id="script-approval"
-          className="fixed inset-0 z-50 flex items-end bg-black/45 p-3"
-          role="dialog"
-          aria-modal="true"
-          aria-labelledby="script-approval-title"
-        >
-          <div className="w-full rounded-xl border bg-background p-4 shadow-xl">
-            <h2 id="script-approval-title" className="text-sm font-semibold">
-              Run this script on {scriptApproval.host || "the current page"}?
-            </h2>
-            <p className="mt-1 text-xs text-muted-foreground">
-              The agent wants to run a script its structured checks can’t express. Nothing runs unless you allow it.
-            </p>
-            <button
-              id="script-code-toggle"
-              type="button"
-              aria-expanded={scriptCodeExpanded}
-              className="mt-3 flex items-center gap-1 text-xs font-medium text-muted-foreground hover:text-foreground"
-              onClick={() => setScriptCodeExpanded((expanded) => !expanded)}
-            >
-              <ChevronRight className={`size-3.5 transition-transform ${scriptCodeExpanded ? "rotate-90" : ""}`} />
-              {scriptCodeExpanded ? "Hide the script" : "Show the script"}
-            </button>
-            {/* Kept in the DOM while collapsed: the exact code is always part
-                of the dialog, hidden is purely visual. */}
-            <pre
-              id="script-code"
-              hidden={!scriptCodeExpanded}
-              className="mt-2 max-h-48 overflow-auto rounded-lg border bg-muted/40 p-2 font-mono text-xs whitespace-pre"
-            >
-              <ScriptCode code={scriptApproval.code} />
-            </pre>
-            <div className="mt-4 flex flex-wrap justify-end gap-2">
-              <Button id="script-deny" type="button" variant="outline" onClick={() => resolveScriptEvaluation("deny")}>
-                Don’t run
-              </Button>
-              <Button id="script-allow-chat" type="button" variant="outline" onClick={() => resolveScriptEvaluation("chat")}>
-                Allow all
-              </Button>
-              <Button id="script-approve" type="button" onClick={() => resolveScriptEvaluation("once")}>
-                Allow once
-              </Button>
-            </div>
-          </div>
-        </div>
-      )}
       <header className="flex shrink-0 items-center justify-between gap-3 border-b border-[var(--line-soft)] px-4 py-3">
-        {/* The wordmark is visible only on the drawer, where this header is
-            the sole thing naming the extension — native sidebars already
-            title the panel "Remixlet" in the browser's own chrome. The host
-            mirrors the tab binding, so it appears once bound. */}
+        {/* The browser's own chrome already titles the panel "Remixlet", so
+            the wordmark stays screen-reader-only. The host mirrors the tab
+            binding, so it appears once bound. */}
         <div className="flex min-w-0 items-center gap-2">
           {/* While the history list is open the left side becomes the way
               back — someone who tapped the history icon mid-chat needs an
@@ -1684,21 +1909,8 @@ export function App() {
             </Button>
           ) : (
             <>
-              <h1
-                className={
-                  isDrawerSurface
-                    ? "text-[10px] font-semibold tracking-[.14em] text-muted-foreground uppercase"
-                    : "sr-only"
-                }
-              >
-                Remixlet
-              </h1>
-              {boundHost && (
-                <>
-                  {isDrawerSurface && <span className="size-[3px] shrink-0 rounded-full bg-foreground/30" aria-hidden />}
-                  <span className="min-w-0 truncate text-xs text-muted-foreground">{boundHost}</span>
-                </>
-              )}
+              <h1 className="sr-only">Remixlet</h1>
+              {boundHost && <span className="min-w-0 truncate text-xs text-muted-foreground">{boundHost}</span>}
             </>
           )}
         </div>
@@ -1729,39 +1941,8 @@ export function App() {
           >
             <SlidersHorizontal className="size-3.5" />
           </Button>
-          {/* The native side panel has no settings affordance here — Choose a
-              model falls back to openSecureSettings when nothing is
-              configured. The drawer keeps its own explicit link (never in the
-              writing area) since it's an embedded, less-trusted surface; its
-              id keeps the drawer suite's credentials-excluded check. */}
-          {isDrawerSurface && (
-            <Button
-              id="drawer-secure-settings"
-              type="button"
-              variant="ghost"
-              size="icon-sm"
-              className="size-[26px] rounded-[7px]"
-              aria-label="Model provider settings"
-              {...statusHint("Model provider settings")}
-              onClick={openSecureSettings}
-            >
-              <Settings className="size-3.5" />
-            </Button>
-          )}
-          {isDrawerSurface && (
-            <Button
-              id="drawer-close"
-              type="button"
-              variant="ghost"
-              size="icon-sm"
-              className="size-[26px] rounded-[7px]"
-              aria-label="Close Remixlet"
-              {...statusHint("Close Remixlet")}
-              onClick={() => window.parent.postMessage({ kind: "remixlet.drawer.close" }, "*")}
-            >
-              <X className="size-[13px]" />
-            </Button>
-          )}
+          {/* No settings affordance here — Choose a model falls back to
+              openSecureSettings when nothing is configured. */}
         </div>
       </header>
 
@@ -1776,10 +1957,17 @@ export function App() {
           id="bound-tab"
           className="flex shrink-0 items-center gap-2 border-b bg-muted/30 px-4 py-1.5 text-xs text-muted-foreground"
         >
-          <SiteIcon eager siteKey={boundTab.siteKey} favIconUrl={boundTab.favIconUrl} className="size-3.5" />
-          <span className="min-w-0 truncate" title={boundTab.title || boundTab.siteKey}>
+          <SiteIcon eager siteKey={boundTab.siteKey} pageOrigin={boundTab.origin} favIconUrl={boundTab.favIconUrl} className="size-3.5" />
+          <button
+            id="show-bound-tab"
+            type="button"
+            className="min-w-0 truncate rounded-sm text-left hover:text-foreground hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+            title={boundTab.title || boundTab.siteKey}
+            {...statusHint("Go to this tab")}
+            onClick={showBoundTab}
+          >
             Working on: {boundTab.title || boundTab.siteKey || "this tab"}
-          </span>
+          </button>
           <Button
             id="new-chat"
             type="button"
@@ -1802,36 +1990,21 @@ export function App() {
           list (and the composer would type into a chat the user can't see).
           A pending tab-binding decision hides it too: the screen below is the
           whole panel until the user opens the site or goes back. */}
-      {view === "chat" && !bindingIssue && capabilities && !capabilities.userScripts && (
-        <Alert
-          variant={capabilities.userScriptsSetup === "unsupported" ? "default" : "destructive"}
-          className="m-3 mb-0 w-auto shrink-0"
-          id="userscripts-alert"
-        >
-          <AlertTitle>
-            {capabilities.userScriptsSetup === "unsupported"
-              ? "JavaScript remixlets aren’t available"
-              : "Setup isn’t finished"}
-          </AlertTitle>
-          <AlertDescription>
-            {capabilities.disabledReasons.userScripts ?? capabilities.userScriptsDisabledReason}
-          </AlertDescription>
-          <div className="mt-2 flex justify-end">
-            <Button type="button" variant="outline" size="sm" onClick={openOnboarding}>
-              {capabilities.userScriptsSetup === "unsupported" ? "Learn more" : "Finish setup"}
-            </Button>
-          </div>
+      {view === "chat" && !bindingIssue && capabilities && !capabilities.box && (
+        <Alert variant="default" className="m-3 mb-0 w-auto shrink-0" id="limited-mode-alert">
+          <AlertTitle>JavaScript remixlets aren’t available</AlertTitle>
+          <AlertDescription>{capabilities.disabledReasons.box}</AlertDescription>
         </Alert>
       )}
 
       {view === "chat" && !bindingIssue && !providerReady && (
-        <Alert className="m-4 mb-0 w-auto shrink-0 !gap-0 !p-4" id="drawer-provider-alert">
+        <Alert className="m-4 mb-0 w-auto shrink-0 !gap-0 !p-4" id="provider-alert">
           <AlertTitle className="text-base">Connect a model securely</AlertTitle>
           <AlertDescription className="mt-1 leading-relaxed">
             Add a provider and check its available models on the dedicated settings page.
           </AlertDescription>
           <div className="mt-4 flex justify-end">
-            <Button id="drawer-open-secure-settings" type="button" variant="outline" size="sm" onClick={openSecureSettings}>
+            <Button id="open-secure-settings" type="button" variant="outline" size="sm" onClick={openSecureSettings}>
               Open settings
             </Button>
           </div>
@@ -1853,17 +2026,27 @@ export function App() {
               <h2 className="text-[15px] leading-snug font-semibold">
                 {bindingIssue.kind === "no-site-tab"
                   ? `No open tab is on ${bindingIssue.siteKey}`
-                  : bindingIssue.siteKey
-                    ? `The ${bindingIssue.siteKey} tab was closed`
-                    : "The tab this chat was working on is closed"}
+                  : bindingIssue.kind === "moved"
+                    ? `This chat works on ${bindingIssue.siteKey}`
+                    : bindingIssue.siteKey
+                      ? `The ${bindingIssue.siteKey} tab was closed`
+                      : "The tab this chat was working on is closed"}
               </h2>
               <p className="text-[13px] leading-relaxed text-muted-foreground">
-                {bindingIssue.siteKey
-                  ? `This chat works on ${bindingIssue.siteKey}. ` +
-                    (bindingIssue.kind === "no-site-tab"
-                      ? "Open the site to continue where it left off."
-                      : "Reopen the site to keep going.")
-                  : "Point the chat at the tab you're looking at now, or go back to your chats."}
+                {/* The move gets its own sentence: the tab is open and still
+                    bound, it is just somewhere else, and saying where is what
+                    tells the user whether they did it or the site did. */}
+                {bindingIssue.kind === "moved"
+                  ? (bindingIssue.now
+                      ? `That tab is now showing ${bindingIssue.now}.`
+                      : "That tab is no longer showing a web page.") +
+                    ` Nothing was read from it. Open ${bindingIssue.siteKey} again to keep going.`
+                  : bindingIssue.siteKey
+                    ? `This chat works on ${bindingIssue.siteKey}. ` +
+                      (bindingIssue.kind === "no-site-tab"
+                        ? "Open the site to continue where it left off."
+                        : "Reopen the site to keep going.")
+                    : "Point the chat at the tab you're looking at now, or go back to your chats."}
               </p>
             </div>
             <div className="mt-2 flex w-full flex-col gap-2">
@@ -1873,7 +2056,7 @@ export function App() {
                   type="button"
                   onClick={() => openSiteAndBind(bindingIssue.siteKey)}
                 >
-                  {bindingIssue.kind === "no-site-tab" ? "Open" : "Reopen"} {bindingIssue.siteKey}
+                  {bindingIssue.kind === "tab-closed" ? "Reopen" : "Open"} {bindingIssue.siteKey}
                 </Button>
               ) : (
                 // A binding without a site (bound to a page no site key could
@@ -1979,7 +2162,17 @@ export function App() {
                         <span className="h-px flex-1 bg-[var(--line-soft)]" aria-hidden />
                         <span className="inline-flex items-center gap-1.5 text-[11px] text-muted-foreground">
                           <Check className="size-[11px] shrink-0 text-primary" strokeWidth={2.4} aria-hidden />
-                          <span>v{message.versionEvent.version} applied</span>
+                          <span>
+                            <button
+                              type="button"
+                              className="version-link underline underline-offset-2 hover:text-foreground"
+                              title={`Open "${message.versionEvent.remixletName}" in the control center`}
+                              onClick={() => openRemixletPage(message.versionEvent!.remixletId)}
+                            >
+                              v{message.versionEvent.version}
+                            </button>{" "}
+                            applied
+                          </span>
                           {/* Revert restores THIS line's version, so the line
                               matching the remixlet's current version gets no
                               button — there's nothing to restore. It gets
@@ -2029,13 +2222,7 @@ export function App() {
                     )}
                   </MessageScrollerItem>
                 ))}
-                {running && (
-                  <div id="turn-status" className="flex items-center gap-2 text-xs text-muted-foreground" aria-live="polite">
-                    <Loader2 className="size-3.5 animate-spin" aria-hidden />
-                    <span>Thinking…</span>
-                    <span className="tabular-nums">{(elapsedMs / 1000).toFixed(1)}s</span>
-                  </div>
-                )}
+                {running && <TurnStatus wait={modelWait} elapsedMs={elapsedMs} />}
               </MessageScrollerContent>
             </MessageScrollerViewport>
             <MessageScrollerButton />
@@ -2044,78 +2231,33 @@ export function App() {
       )}
 
       {view === "chat" && capabilityRequest && (
-        // One card, one border: the capability explanations are plain text rows
-        // inside it, not nested boxes. Divs rather than <p> because
-        // AlertDescription puts a 1rem margin under every non-last paragraph.
-        <Alert id="capability-request" className="m-3 max-h-[45vh] w-auto shrink-0 gap-2 overflow-y-auto">
-          <AlertTitle>Remixlet needs permission</AlertTitle>
-          <AlertDescription>
-            <ul className="flex flex-col gap-3">
-              {capabilityRequest.capabilities.map((capability) => {
-                const copy = capabilityExplanation(capability);
-                return (
-                  <li key={capability} className="requested-capability">
-                    <div className="text-xs font-medium text-foreground">{copy.title}</div>
-                    <div className="mt-1 text-xs">{copy.detail}</div>
-                  </li>
-                );
-              })}
-            </ul>
-          </AlertDescription>
-          <div className="mt-1 flex justify-end gap-2">
-            <Button
-              id="capability-request-dismiss"
-              type="button"
-              variant="ghost"
-              size="sm"
-              onClick={() => setCapabilityRequest(null)}
-            >
-              Not now
-            </Button>
-            <Button
-              id="capability-request-allow"
-              type="button"
-              size="sm"
-              disabled={running || !providerReady}
-              onClick={authorizeCapabilityRequest}
-            >
-              Allow
-            </Button>
-          </div>
-        </Alert>
+        <PermissionCard
+          id="capability-request"
+          title="Remixlet needs permission"
+          rows={capabilityRequest.capabilities.map((capability) => ({
+            ...capabilityExplanation(capability),
+            icon: capabilityIcon(capability),
+          }))}
+          allowLabel="Allow"
+          allowDisabled={running || !providerReady}
+          onAllow={authorizeCapabilityRequest}
+          onDismiss={() => setCapabilityRequest(null)}
+        />
       )}
 
       {view === "chat" && devObserveRequest && !capabilityRequest && (
         // The dev-observe ask (wiki/raw/handoffs/2026-08-10-broad-observe-session-
-        // grant.md): same one-card treatment as the capability ask, fully
-        // panel-authored copy, session-scoped grant on Allow.
-        <Alert id="dev-observe-request" className="m-3 max-h-[45vh] w-auto shrink-0 gap-2 overflow-y-auto">
-          <AlertTitle>Remixlet needs a closer look</AlertTitle>
-          <AlertDescription>
-            <div className="text-xs font-medium text-foreground">{DEV_OBSERVE_EXPLANATION.title}</div>
-            <div className="mt-1 text-xs">{DEV_OBSERVE_EXPLANATION.detail}</div>
-          </AlertDescription>
-          <div className="mt-1 flex justify-end gap-2">
-            <Button
-              id="dev-observe-request-dismiss"
-              type="button"
-              variant="ghost"
-              size="sm"
-              onClick={() => setDevObserveRequest(false)}
-            >
-              Not now
-            </Button>
-            <Button
-              id="dev-observe-request-allow"
-              type="button"
-              size="sm"
-              disabled={running || !providerReady}
-              onClick={authorizeDevObserveRequest}
-            >
-              Allow
-            </Button>
-          </div>
-        </Alert>
+        // grant.md): session-scoped grant on Allow, and Allow reloads the page,
+        // so the button says so.
+        <PermissionCard
+          id="dev-observe-request"
+          title="Remixlet needs a closer look"
+          rows={[{ ...DEV_OBSERVE_EXPLANATION, icon: DEV_OBSERVE_ICON }]}
+          allowLabel="Allow and reload"
+          allowDisabled={running || !providerReady}
+          onAllow={authorizeDevObserveRequest}
+          onDismiss={() => setDevObserveRequest(false)}
+        />
       )}
 
       {view === "chat" && !bindingIssue && queuedPrompts.length > 0 && (
@@ -2236,7 +2378,13 @@ export function App() {
               }
             }}
           />
-          <div className="flex items-center gap-1.5 p-2">
+          {/* Toolbar chips are lean on purpose: a side panel can be 320px
+              wide, and every pixel of chrome (padding, caret) comes straight
+              out of the model name. The hover fill is the whole "this opens a
+              menu" affordance; the menu itself opens on click only. When the
+              row overflows, only the model name truncates: the reasoning chip
+              is shrink-0, since "Medi…" tells the user nothing. */}
+          <div className="flex items-center gap-1 p-2">
             <button
               id="chat-model"
               type="button"
@@ -2244,18 +2392,56 @@ export function App() {
               aria-label="Choose model"
               aria-expanded={modelMenuOpen}
               {...statusHint("Model")}
-              className="inline-flex h-7 items-center gap-[5px] rounded-lg px-2 text-xs font-medium text-muted-foreground hover:bg-foreground/7 hover:text-foreground disabled:opacity-50"
-              onClick={() => (modelOptions.length === 0 ? openSecureSettings() : setModelMenuOpen((open) => !open))}
+              className="inline-flex h-7 min-w-0 items-center gap-1 rounded-lg px-1.5 text-xs font-medium text-muted-foreground hover:bg-foreground/7 hover:text-foreground disabled:opacity-50"
+              onClick={() => {
+                if (modelOptions.length === 0) {
+                  openSecureSettings();
+                  return;
+                }
+                if (modelMenuOpen) setComposerMenu(null);
+                else openModelMenu();
+              }}
+              onKeyDown={(event) => {
+                if (event.key === "ArrowDown" && !modelMenuOpen && modelOptions.length > 0) {
+                  event.preventDefault();
+                  openModelMenu();
+                }
+              }}
             >
-              <Sparkles className="size-3 shrink-0" aria-hidden />
-              <span className="max-w-40 truncate">
-                {providerSettings.selectedModel?.modelId ?? "Choose a model"}
+              {/* The provider's mark, so two providers serving the same model
+                  id stay tellable apart while the menu is closed. */}
+              {thinkingProvider && providerSettings.selectedModel ? (
+                <ProviderLogo kind={thinkingProvider.kind} className="size-3 shrink-0" />
+              ) : (
+                <Sparkles className="size-3 shrink-0" aria-hidden />
+              )}
+              <span className="min-w-0 max-w-40 truncate">
+                {thinkingProvider && providerSettings.selectedModel
+                  ? modelDisplayName({ providerKind: thinkingProvider.kind, modelId: providerSettings.selectedModel.modelId })
+                  : "Choose a model"}
               </span>
-              <ChevronDown
-                className={`size-2.5 shrink-0 transition-transform ${modelMenuOpen ? "rotate-180" : ""}`}
-                aria-hidden
-              />
             </button>
+            {thinkingOptions.length > 0 && (
+              <button
+                id="chat-reasoning"
+                type="button"
+                disabled={running}
+                aria-label="Choose reasoning level"
+                aria-expanded={reasoningMenuOpen}
+                {...statusHint("Reasoning level")}
+                className="inline-flex h-7 shrink-0 items-center gap-1 rounded-lg px-1.5 text-xs font-medium text-muted-foreground hover:bg-foreground/7 hover:text-foreground disabled:opacity-50"
+                onClick={() => setComposerMenu(reasoningMenuOpen ? null : "reasoning")}
+                onKeyDown={(event) => {
+                  if (event.key === "ArrowDown" && !reasoningMenuOpen) {
+                    event.preventDefault();
+                    setComposerMenu("reasoning");
+                  }
+                }}
+              >
+                <Brain className="size-3 shrink-0" aria-hidden />
+                <span className="max-w-24 truncate">{reasoningTriggerLabel}</span>
+              </button>
+            )}
             <div className="flex-1" />
             <button
               id="markup-page"
@@ -2300,20 +2486,152 @@ export function App() {
           </div>
           {modelMenuOpen && (
             <div id="model-menu" className="flex flex-col gap-0.5 border-t border-[var(--line-soft)] p-1.5">
-              {modelOptions.map((model) => {
-                const current =
-                  providerSettings.selectedModel?.providerId === model.providerId &&
-                  providerSettings.selectedModel?.modelId === model.modelId;
+              <input
+                id="model-search"
+                type="text"
+                autoFocus
+                value={modelQuery}
+                placeholder="Search models"
+                aria-label="Search models"
+                autoComplete="off"
+                spellCheck={false}
+                role="combobox"
+                aria-expanded
+                aria-controls="model-listbox"
+                aria-autocomplete="list"
+                aria-activedescendant={modelMenuItems.length > 0 ? modelOptionId(activeModelPos) : undefined}
+                className="mb-0.5 h-7 rounded-[7px] border border-[var(--line-soft)] bg-transparent px-2 text-[12.5px] text-foreground outline-none placeholder:text-muted-foreground focus:border-primary/45"
+                onChange={(event) => {
+                  setModelQuery(event.target.value);
+                  setActiveModelIndex(0);
+                }}
+                onKeyDown={(event) => {
+                  const count = modelMenuItems.length;
+                  const step = (next: number): void => {
+                    event.preventDefault();
+                    setActiveModelIndex(next);
+                    document.getElementById(modelOptionId(next))?.scrollIntoView({ block: "nearest" });
+                  };
+                  if (event.key === "ArrowDown" && count > 0) step((activeModelPos + 1) % count);
+                  if (event.key === "ArrowUp" && count > 0) step((activeModelPos - 1 + count) % count);
+                  if (event.key === "Escape") {
+                    event.preventDefault();
+                    closeModelMenu();
+                  }
+                  if (event.key === "Enter") {
+                    event.preventDefault();
+                    const item = modelMenuItems[activeModelPos];
+                    if (!item) return;
+                    if (item.kind === "model") selectModel(item.model);
+                    else setAllModelsOpen((open) => !open);
+                  }
+                }}
+              />
+              {/* Constant height regardless of row count: the menu hangs off a
+                  bottom-anchored card, so any height change while typing would
+                  move the search input under the user's fingers. The list
+                  scrolls instead. */}
+              <div id="model-listbox" role="listbox" aria-label="Models" className="flex h-[264px] flex-col gap-0.5 overflow-y-auto">
+                {modelMenuItems.map((item, index) =>
+                  item.kind === "model" ? (
+                    modelRow(item.model, index)
+                  ) : (
+                    <button
+                      key="all-models"
+                      id="all-models"
+                      type="button"
+                      role="option"
+                      aria-selected={false}
+                      aria-expanded={allModelsOpen}
+                      tabIndex={-1}
+                      className={`flex shrink-0 items-center gap-[5px] rounded-[7px] px-2 py-[7px] text-left text-[11px] font-medium ${
+                        index === activeModelPos ? "bg-foreground/7 text-foreground" : "text-muted-foreground"
+                      }`}
+                      onMouseEnter={() => setActiveModelIndex(index)}
+                      onClick={() => setAllModelsOpen((open) => !open)}
+                    >
+                      <ChevronDown
+                        className={`size-2.5 shrink-0 transition-transform ${allModelsOpen ? "" : "-rotate-90"}`}
+                        aria-hidden
+                      />
+                      All models ({extraModels.length})
+                    </button>
+                  ),
+                )}
+                {filteredModels && filteredModels.length === 0 && (
+                  <p className="shrink-0 px-2 py-[7px] text-[11px] text-muted-foreground">
+                    No models match “{modelQuery.trim()}”
+                  </p>
+                )}
+              </div>
+            </div>
+          )}
+          {reasoningMenuOpen && (
+            <div
+              id="reasoning-menu"
+              role="radiogroup"
+              aria-label="Reasoning level"
+              className="flex flex-col gap-0.5 border-t border-[var(--line-soft)] p-1.5"
+              onKeyDown={(event) => {
+                if (event.key === "Escape") {
+                  event.preventDefault();
+                  closeReasoningMenu();
+                  return;
+                }
+                if (event.key !== "ArrowDown" && event.key !== "ArrowUp") return;
+                event.preventDefault();
+                const rows = [...event.currentTarget.querySelectorAll<HTMLButtonElement>('[role="radio"]')];
+                const at = rows.findIndex((row) => row === document.activeElement);
+                const count = rows.length;
+                if (count === 0) return;
+                rows[(at + (event.key === "ArrowDown" ? 1 : -1) + count) % count]?.focus();
+              }}
+            >
+              {/* A model whose provider names no default gets a "Default" row
+                  meaning "let the provider decide" — choosing it clears the
+                  stored override, which is also what choosing the declared
+                  default (badged below) does. The stored map only ever holds
+                  deliberate overrides. */}
+              {thinkingDeclared?.defaultLevel === undefined && (
+                <button
+                  type="button"
+                  role="radio"
+                  aria-checked={chosenThinkingLevel === undefined}
+                  tabIndex={-1}
+                  className="flex shrink-0 items-center justify-between gap-2 rounded-[7px] px-2 py-[7px] text-left outline-none hover:bg-foreground/7 focus:bg-foreground/7"
+                  onClick={() => selectThinkingLevel(undefined)}
+                >
+                  <span className="flex min-w-0 flex-col gap-px">
+                    <span className="truncate text-[12.5px] text-foreground">Default</span>
+                    <span className="truncate text-[11px] text-muted-foreground">
+                      Let {thinkingProvider?.name ?? "the provider"} decide
+                    </span>
+                  </span>
+                  {chosenThinkingLevel === undefined && (
+                    <Check className="size-[13px] shrink-0 text-primary" strokeWidth={2.4} aria-hidden />
+                  )}
+                </button>
+              )}
+              {thinkingOptions.map((level) => {
+                const isDeclaredDefault = level === thinkingDeclared?.defaultLevel;
+                const current = level === (chosenThinkingLevel ?? thinkingDeclared?.defaultLevel);
                 return (
                   <button
-                    key={`${model.providerId}:${model.modelId}`}
+                    key={level}
                     type="button"
-                    className="flex items-center justify-between gap-2 rounded-[7px] px-2 py-[7px] text-left hover:bg-foreground/7"
-                    onClick={() => selectModel(model)}
+                    role="radio"
+                    aria-checked={current}
+                    tabIndex={-1}
+                    className="flex shrink-0 items-center justify-between gap-2 rounded-[7px] px-2 py-[7px] text-left outline-none hover:bg-foreground/7 focus:bg-foreground/7"
+                    onClick={() => selectThinkingLevel(isDeclaredDefault ? undefined : level)}
                   >
-                    <span className="flex min-w-0 flex-col gap-px">
-                      <span className="truncate text-[12.5px] text-foreground">{model.modelId}</span>
-                      <span className="truncate text-[11px] text-muted-foreground">{model.providerName}</span>
+                    <span className="flex min-w-0 items-center gap-1.5">
+                      <span className="truncate text-[12.5px] text-foreground">{THINKING_LEVEL_LABELS[level]}</span>
+                      {isDeclaredDefault && (
+                        <span className="shrink-0 rounded-full border border-[var(--line-soft)] px-1.5 text-[10px] text-muted-foreground">
+                          Default
+                        </span>
+                      )}
                     </span>
                     {current && <Check className="size-[13px] shrink-0 text-primary" strokeWidth={2.4} aria-hidden />}
                   </button>

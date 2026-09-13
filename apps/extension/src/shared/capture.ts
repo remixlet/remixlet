@@ -42,20 +42,43 @@ export interface FrameEntry {
 }
 
 /**
- * Per-host tally of the page's data requests (fetch/XHR calls and JSON/XML
- * responses) read from the performance resource timeline at snapshot time.
- * Hostname and counts only — never paths or query strings, which would echo
- * tracking parameters into model context (the FrameEntry.origin rule).
+ * One data endpoint group of the current page load in the capture's census
+ * (wiki/design/network-probes.md): host and path shape, never a URL, with
+ * the id the model replays it by. Read from the resource timeline through
+ * the list_network_resources template in census mode and registered by the
+ * worker, so the id here is the same one a later listing shows.
  */
-export interface DataRequestHostSummary {
+export interface NetworkEndpointSummary {
+  id: string;
   host: string;
-  /** Data requests to this host recorded in the resource timeline. */
+  /** Path shape plus query parameter names (/tracks/:n?client_id,limit). */
+  path: string;
+  /** Calls to this endpoint in the timeline. */
   count: number;
-  /**
-   * How many of count carried a JSON content type. 0 also where the browser
-   * does not expose contentType on resource timing (pre-130 Chrome, Firefox).
-   */
-  jsonCount: number;
+  /** Bytes across those calls, or null when the browser exposed no size. */
+  bytes: number | null;
+  /** decoded: body bytes as parsed; transfer: bytes on the wire where the body size is hidden; hidden: neither. */
+  sizeSource: "decoded" | "transfer" | "hidden";
+  contentType: string | null;
+  statuses: number[];
+  sameSite: boolean;
+}
+
+/** Endpoint groups the census keeps, largest by size; the rest are counted. */
+export const NETWORK_CENSUS_MAX_ENDPOINTS = 30;
+
+/** Stable reason shared by the worker capture and the sidebar activity row. */
+export const SCREENSHOT_IDENTITY_CHANGED_MESSAGE =
+  "Screenshot skipped because the active tab or page changed while it was being taken.";
+
+export interface NetworkCensus {
+  endpoints: NetworkEndpointSummary[];
+  /** Groups in the timeline, shown or not. */
+  endpointTotal: number;
+  /** Data requests in the timeline. */
+  requestTotal: number;
+  /** The browser's resource-timing buffer is full, so later requests are missing (250 entries by default). */
+  bufferPossiblySaturated: boolean;
 }
 
 export interface CaptureBundle {
@@ -79,11 +102,11 @@ export interface CaptureBundle {
    */
   frames?: FrameEntry[];
   /**
-   * Per-host data-request tallies, collected with the DOM snapshot (URL-level
-   * visibility only — no bodies). Absent when the backend could not collect
-   * it; empty means the timeline really recorded no data requests.
+   * The data endpoints of the current page load, with ids (no URLs, no
+   * bodies). Absent when the census could not be read; an empty endpoint
+   * list means the timeline really recorded no data requests.
    */
-  dataRequests?: DataRequestHostSummary[];
+  networkCensus?: NetworkCensus;
   screenshot?: { dataUrl: string; coverage: "visible" | "full" };
   network?: NetworkEntry[];
   console?: ConsoleEntry[];

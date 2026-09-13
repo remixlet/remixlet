@@ -23,15 +23,6 @@ import { useEffect, useState } from "react";
 import { ArrowLeft, FileCode2, History, MessagesSquare, ShieldCheck } from "lucide-react";
 
 import { SparkAreaChart } from "@/components/charts/spark-chart";
-import {
-  AlertDialog,
-  AlertDialogCancel,
-  AlertDialogContent,
-  AlertDialogDescription,
-  AlertDialogFooter,
-  AlertDialogHeader,
-  AlertDialogTitle,
-} from "@/components/ui/alert-dialog";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
@@ -40,6 +31,7 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { cn } from "@/lib/utils";
 
 import { capabilityExplanation } from "../../shared/capability-copy.js";
+import { describeLookReview } from "../../shared/look-review.js";
 
 import type { ConversationMeta } from "../../store/conversation-index.js";
 import type { RegistryEntry, RemixletVersion } from "../../store/remixlet-store.js";
@@ -343,6 +335,49 @@ function HealthCard({
   );
 }
 
+// The visual review (wiki/design/look-review.md): what the model said after
+// comparing cropped screenshots of its control with the page's own, and —
+// when stored — the crop it compared, so the user can judge the judgement in
+// one glance. Stale reviews (an older version's) say which. It renders as the
+// last section of the README sheet, in the README's own heading style: it is
+// prose about the remixlet, not a health number, and the crop needs the
+// width. It stays its own component because it is not part of README.md —
+// it is a store field carried forward across versions.
+function VisualReviewSection({ entry }: { entry: RegistryEntry }) {
+  const review = entry.lookReview;
+  const [crop, setCrop] = useState<string | undefined>(undefined);
+  const hasCrop = review?.hasCrop === true;
+  useEffect(() => {
+    setCrop(undefined);
+    if (!hasCrop) return;
+    let cancelled = false;
+    void send({ kind: "remixlet.readLookCrop", id: entry.id }, "remixlet.lookCrop")
+      .then((reply) => {
+        if (!cancelled) setCrop(reply.dataUrl);
+      })
+      .catch(() => undefined);
+    return () => {
+      cancelled = true;
+    };
+  }, [entry.id, entry.headSha, hasCrop]);
+  if (!review) return null;
+  const stale = review.version !== undefined && review.version !== entry.version ? ` (v${review.version})` : "";
+  return (
+    <section id="remixlet-look" className="readme-doc mt-3" data-verdict={review.verdict}>
+      <h2>Visual review{stale}</h2>
+      <p className="look-review-line">{describeLookReview(review)}</p>
+      {crop && (
+        <img
+          className="look-review-crop max-w-full rounded-md border"
+          src={crop}
+          alt="The control as Remixlet saw it, in its row on the page"
+          title="What Remixlet compared"
+        />
+      )}
+    </section>
+  );
+}
+
 // The newest linked conversation, its title styled like the panel's user
 // bubble — the rail's pointer back into the chat that shaped this remixlet.
 function LatestChatCard({ chats }: { chats: ConversationMeta[] | undefined }) {
@@ -372,47 +407,23 @@ function LatestChatCard({ chats }: { chats: ConversationMeta[] | undefined }) {
 
 // ---- capabilities -----------------------------------------------------------
 
-interface RemixletCapabilities {
-  declared: string[];
-  granted: string[];
-}
-
-// What the remixlet asked for and what it currently holds, in plain words, with
-// a per-capability revoke. This is the only place a granted power can be walked
-// back without deleting the whole remixlet — and the first surface that shows,
-// standing, what a live remixlet is allowed to do. A capability declared but
-// not granted (revoked here, or never approved) reads as inert.
+// What the remixlet is allowed to do, in plain words — the first surface that
+// shows, standing, what a live remixlet holds. The stored manifest is the
+// approval record (every capability here passed the activation dialog), so
+// there is nothing to toggle: walking a permission back means asking a chat
+// for a version without it, or archiving/deleting the remixlet.
 //
-// Revoking breaks the remixlet (its code was built expecting the permission),
-// so it is confirmed first: the dialog says the remixlet will be parked as
-// "needs attention" and that a chat can bring it back. A failed revoke keeps
-// its dialog open and says why, matching the lifecycle dialogs.
-function CapabilitiesCard({
-  capabilities,
-  busy,
-  onRevoke,
-}: {
-  capabilities: RemixletCapabilities | undefined;
-  busy: boolean;
-  onRevoke: (capability: string) => Promise<void>;
-}) {
-  const [confirming, setConfirming] = useState<string | undefined>(undefined);
-  const [pending, setPending] = useState(false);
-  const [error, setError] = useState("");
+// The baseline row is always first: every remixlet reads and changes the
+// page it runs on, and the box (wiki/design/mediated-execution.md) bounds
+// where what it reads can go — the site itself and the granted hosts listed
+// under it. An empty grant list is not "no permissions"; it is the baseline
+// and nothing more.
+const BASELINE_TITLE = "Reads and changes the page it runs on";
+const BASELINE_DETAIL =
+  "Its code runs in a sandbox, so what it reads can reach only this site and the sites listed below.";
 
-  function confirmRevoke(): void {
-    if (confirming === undefined || pending) return;
-    setPending(true);
-    setError("");
-    void onRevoke(confirming)
-      .then(() => setConfirming(undefined))
-      .catch((cause: unknown) => setError(String(cause)))
-      .finally(() => setPending(false));
-  }
-
-  const confirmingTitle = confirming === undefined ? undefined : capabilityExplanation(confirming).title;
+function CapabilitiesCard({ capabilities }: { capabilities: string[] | undefined }) {
   return (
-    <>
     <Card id="remixlet-capabilities" className="gap-2 py-4">
       <CardContent className="flex flex-col gap-3 px-4">
         <p className="flex items-center gap-1.5 font-mono text-[10.5px] font-semibold tracking-[0.1em] text-muted-foreground uppercase">
@@ -421,44 +432,26 @@ function CapabilitiesCard({
         </p>
         {capabilities === undefined ? (
           <p className="text-xs text-muted-foreground">Loading…</p>
-        ) : capabilities.declared.length === 0 ? (
-          <p className="text-xs text-muted-foreground">This remixlet uses no special permissions.</p>
         ) : (
           <ul className="flex flex-col divide-y">
-            {capabilities.declared.map((capability) => {
+            <li id="remixlet-capabilities-baseline" className="capability-row flex items-start gap-8 py-2.5 first:pt-0 last:pb-0">
+              <div className="min-w-0 flex-1">
+                <p className="text-sm font-medium">{BASELINE_TITLE}</p>
+                <p className="text-xs text-muted-foreground">{BASELINE_DETAIL}</p>
+              </div>
+            </li>
+            {capabilities.map((capability) => {
               const copy = capabilityExplanation(capability);
-              const granted = capabilities.granted.includes(capability);
               return (
                 <li
                   key={capability}
                   className="capability-row flex items-start gap-8 py-2.5 first:pt-0 last:pb-0"
                   data-capability={capability}
-                  data-granted={granted ? "" : undefined}
                 >
                   <div className="min-w-0 flex-1">
                     <p className="text-sm font-medium">{copy.title}</p>
                     <p className="text-xs text-muted-foreground">{copy.detail}</p>
                   </div>
-                  {granted ? (
-                    <Button
-                      type="button"
-                      variant="outline"
-                      size="xs"
-                      className="shrink-0"
-                      data-action="revoke"
-                      disabled={busy || pending}
-                      onClick={() => {
-                        setError("");
-                        setConfirming(capability);
-                      }}
-                    >
-                      Revoke
-                    </Button>
-                  ) : (
-                    <Badge variant="outline" className="shrink-0 text-muted-foreground">
-                      Not granted
-                    </Badge>
-                  )}
                 </li>
               );
             })}
@@ -466,48 +459,12 @@ function CapabilitiesCard({
         )}
       </CardContent>
     </Card>
-
-    <AlertDialog
-      open={confirming !== undefined}
-      onOpenChange={(open) => {
-        if (open) return;
-        setConfirming(undefined);
-        setError("");
-      }}
-    >
-      <AlertDialogContent data-revoke-capability={confirming}>
-        <AlertDialogHeader>
-          <AlertDialogTitle>Revoke “{confirmingTitle}”?</AlertDialogTitle>
-          <AlertDialogDescription>
-            This remixlet was built expecting this permission, so revoking it will break it: it stops running and is
-            marked “needs attention”. To bring it back to life, ask in a chat — the remixlet can be rewritten to work
-            without this permission, or ask you for the permission again.
-          </AlertDialogDescription>
-        </AlertDialogHeader>
-        {error && (
-          <p className="action-error text-sm text-destructive" role="alert">
-            {error}
-          </p>
-        )}
-        <AlertDialogFooter>
-          <AlertDialogCancel data-action="cancel-revoke">Cancel</AlertDialogCancel>
-          <Button type="button" data-action="confirm-revoke" disabled={pending} onClick={confirmRevoke}>
-            {pending ? "Revoking…" : "Revoke"}
-          </Button>
-        </AlertDialogFooter>
-      </AlertDialogContent>
-    </AlertDialog>
-    </>
   );
 }
 
 // The plain-words account of why a system-parked remixlet is off the page,
 // with the stored failure detail when the record carries one.
 function needsAttentionExplanation(entry: RegistryEntry): string {
-  if (entry.attention?.kind === "capability-revoked") {
-    const title = capabilityExplanation(entry.attention.capability).title;
-    return `The permission “${title}” was revoked, so this remixlet is off the page. Ask in a chat to bring it back — it can be rewritten to work without that permission, or ask for it again.`;
-  }
   const base = "The last change couldn't be confirmed working, so this remixlet is off the page until it's fixed.";
   const result = entry.lastVerifyResult;
   if (!result || result.outcome === "passed") return base;
@@ -519,10 +476,13 @@ function needsAttentionExplanation(entry: RegistryEntry): string {
 
 export function RemixletPage({
   entry,
+  quarantine,
   siteIcons,
   onChanged,
 }: {
   entry: RegistryEntry;
+  /** Why the worker refuses to run this enabled artifact, when it does. */
+  quarantine: string | undefined;
   siteIcons: Record<string, string> | undefined;
   onChanged: () => Promise<void>;
 }) {
@@ -540,7 +500,7 @@ export function RemixletPage({
   // unmounts only when its animation reports done.
   const [slide, setSlide] = useState<SlideView | undefined>(undefined);
   const [slideClosing, setSlideClosing] = useState(false);
-  const [capabilities, setCapabilities] = useState<RemixletCapabilities | undefined>(undefined);
+  const [capabilities, setCapabilities] = useState<string[] | undefined>(undefined);
 
   const archived = entry.state === "archived";
   const slideOpen = slide !== undefined && !slideClosing;
@@ -565,27 +525,15 @@ export function RemixletPage({
     );
   }, [entry.id, entry.headSha]);
 
-  // Re-read after every version change too: an activation can rewrite the grant
-  // record (a manifest that drops a capability revokes it), so the panel must
-  // not show a stale set.
+  // Re-read after every version change too: the stored manifest is the
+  // approval record, so each activation can change the set and the panel must
+  // not show a stale one.
   useEffect(() => {
     setCapabilities(undefined);
     void send({ kind: "remixlet.capabilities", id: entry.id }, "remixlet.capabilitiesResult")
-      .then((reply) => setCapabilities({ declared: reply.declared, granted: reply.granted }))
+      .then((reply) => setCapabilities(reply.capabilities))
       .catch((cause: unknown) => console.error("[remixlet] capability read failed", cause));
   }, [entry.id, entry.headSha]);
-
-  // Not runAction: the confirm dialog owns the pending/error lifecycle (a
-  // failed revoke keeps the dialog open and says why). onChanged still runs so
-  // the header flips to "needs attention" — a revoke parks the remixlet.
-  async function revokeCapability(capability: string): Promise<void> {
-    const reply = await send(
-      { kind: "remixlet.revokeCapability", id: entry.id, capability },
-      "remixlet.capabilitiesResult",
-    );
-    setCapabilities({ declared: reply.declared, granted: reply.granted });
-    await onChanged();
-  }
 
   useEffect(() => {
     void send({ kind: "usage.read" }, "usage.result")
@@ -654,16 +602,30 @@ export function RemixletPage({
               needs attention
             </Badge>
           ) : (
-            <Switch
-              className="entry-toggle"
-              checked={entry.state === "enabled"}
-              disabled={busy}
-              onCheckedChange={(checked) =>
-                runAction(async () => {
-                  await send({ kind: "remixlet.setEnabled", id: entry.id, enabled: checked, reloadMatching: true }, "remixlet.entry");
-                })
-              }
-            />
+            <>
+              {quarantine !== undefined && (
+                // The switch says on and is honest — the user did not turn it
+                // off — but the worker could not admit the files. The badge is
+                // the state; the reason rides its tooltip.
+                <Badge
+                  variant="outline"
+                  className="entry-quarantined shrink-0 border-[var(--signal)]/40 text-[var(--signal)]"
+                  title={`Not running: ${quarantine}. Update it from a chat, roll back to an earlier version, or delete it.`}
+                >
+                  not running
+                </Badge>
+              )}
+              <Switch
+                className="entry-toggle"
+                checked={entry.state === "enabled"}
+                disabled={busy}
+                onCheckedChange={(checked) =>
+                  runAction(async () => {
+                    await send({ kind: "remixlet.setEnabled", id: entry.id, enabled: checked, reloadMatching: true }, "remixlet.entry");
+                  })
+                }
+              />
+            </>
           )}
           {/* Archive and delete-forever live behind this menu rather than as
               standing buttons: they are rare, and two of the three are one-way. */}
@@ -694,12 +656,15 @@ export function RemixletPage({
                 <Card className="py-0">
                   <CardContent className="p-7">
                     <ReadmeView key={entry.headSha} id={entry.id} sha={entry.headSha} />
+                    {entry.lookReview && <VisualReviewSection entry={entry} />}
                   </CardContent>
                 </Card>
                 {/* Permissions sit in the main column under the README — wide
                     enough for the titles and revoke consequences to read, but
-                    not stretched under the rail. */}
-                <CapabilitiesCard capabilities={capabilities} busy={busy} onRevoke={revokeCapability} />
+                    not stretched under the rail. Only for an entry the mirror
+                    build admitted: a quarantined one holds nothing live, and
+                    its stored names may predate this build's copy table. */}
+                {quarantine === undefined && <CapabilitiesCard capabilities={capabilities} />}
               </div>
               <aside className="flex w-full shrink-0 flex-col gap-3 lg:w-64">
                 <HealthCard

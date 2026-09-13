@@ -1,6 +1,8 @@
-export { createAgentRuntime } from "./pi-runtime.js";
+export { createAgentRuntime, MODEL_ATTEMPTS, MODEL_CONNECT_MS, MODEL_RETRY_DELAYS_MS, MODEL_STALL_MS } from "./pi-runtime.js";
 export {
   AgentContract,
+  ContractViolationError,
+  hardcodedTypography,
   isContractNudgePrompt,
   resumeVerificationPrompt,
   writeIntroducesUi,
@@ -25,19 +27,23 @@ export {
   catalogEntry,
   catalogModel,
   endpointPlan,
+  isFeaturedModel,
   type CatalogModel,
   type ProviderApi,
   type ProviderCatalogEntry,
   type ProviderKind,
 } from "./provider-catalog.js";
-export { ProviderTurnError } from "./types.js";
+export { supportedThinkingLevels } from "./providers.js";
+export { ProviderTurnError, THINKING_LEVELS } from "./types.js";
 export type {
   AgentPromptOptions,
   AgentRuntime,
   AgentRuntimeConfig,
   AgentRuntimeEvent,
+  ModelWaitEvent,
   AgentToolOutput,
   AgentToolSpec,
   ProviderEndpoint,
+  ThinkingLevel,
   TranscriptEntry,
 } from "./types.js";

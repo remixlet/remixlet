@@ -192,6 +192,27 @@ export function catalogModel(kind: string, modelId: string): CatalogModel | unde
 }
 
 /**
+ * Whether the model picker lists this model in its featured tier. pi's
+ * catalog is a curation, not a mirror — it carries the models worth reaching
+ * for, while live discovery returns everything the credential can see — so
+ * catalog membership is the featured signal. Kinds whose lists pi cannot
+ * judge feature everything: the Codex manifest is already curated upstream
+ * (visibility === "list"), and a custom endpoint's models are exactly what
+ * the user connected it for.
+ *
+ * One structural demotion on top: a dated snapshot (…-YYYY-MM-DD) whose
+ * undated base id is also in `siblingIds` (the same provider's model list)
+ * is never featured — the base alias is the one to pick, and the snapshot
+ * stays reachable under "All models".
+ */
+export function isFeaturedModel(kind: ProviderKind, modelId: string, siblingIds: readonly string[]): boolean {
+  const snapshot = /^(.*)-\d{4}-\d{2}-\d{2}$/.exec(modelId);
+  if (snapshot && siblingIds.includes(snapshot[1]!)) return false;
+  if (kind === "codex" || kind === "remixlet") return true;
+  return catalogModel(kind, modelId) !== undefined;
+}
+
+/**
  * Which API to speak, and whether the model can see images, for one selected
  * model. `vision: undefined` means pi doesn't know this model — the caller
  * applies its own conservative heuristic.

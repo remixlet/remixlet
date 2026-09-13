@@ -1,31 +1,19 @@
 // Worker-side store for the development-time observation grant
 // (wiki/raw/handoffs/2026-08-10-broad-observe-session-grant.md). The record is the
 // MV3-reconstructible truth: the panel's Allow click writes it, every
-// reconcileUserScripts pass rebuilds the observer registration from it (so a
-// worker restart mid-conversation re-registers), and expiry/removal drops the
-// registration on the next reconcile. Enable/disable orchestration (write →
+// reconcileRegistrations pass rebuilds the observer registration's matches from
+// it (so a worker restart mid-conversation re-registers), and expiry/removal
+// drops the origin on the next reconcile. Enable/disable orchestration (write →
 // reconcile → tab reload) lives in worker/index.ts to keep this module free of
-// an import cycle with injection.ts, which consumes devObserveRegistrations().
+// an import cycle with injection.ts, which consumes devObserveOrigins().
 
-import { devObserveCode } from "../bridge/dev-observe.js";
 import { ext } from "../platform/ext.js";
-import type { UserScriptRegistration } from "../platform/script-injector.js";
 import {
   DEV_OBSERVE_GRANTS_KEY,
   devObserveGrantAuthorizes,
   devObserveGrantExpired,
   type DevObserveGrant,
 } from "../shared/dev-observe.js";
-
-/**
- * Registration id for a conversation's observer. "@" cannot occur in a
- * remixlet id (worker/injection.ts MAIN_SCRIPT_SUFFIX invariant), and the
- * conversation id is a UUID (never "main"), so this can collide with neither
- * "rmx-<remixlet id>" nor "rmx-<remixlet id>@main".
- */
-export function devObserveScriptId(conversationId: string): string {
-  return `rmx-devobs@${conversationId}`;
-}
 
 export async function readDevObserveGrants(): Promise<Record<string, DevObserveGrant>> {
   const stored = await ext.storage.local.get(DEV_OBSERVE_GRANTS_KEY);
@@ -88,20 +76,16 @@ export function liveDevObserveGrants(now = Date.now()): Promise<DevObserveGrant[
 }
 
 /**
- * The registrations reconcileUserScripts must include for the live grants.
- * MAIN world at document_start (the patch must beat the page's first fetch),
- * matches pinned to the origin recorded at grant time — a cross-origin
- * navigation mid-conversation carries no observation with it.
+ * The origins the observer registration must cover: those of the live
+ * grants, each once. worker/injection.ts turns them into the one MAIN-world
+ * document_start registration of the shipped observer file.
  */
-export async function devObserveRegistrations(now = Date.now()): Promise<UserScriptRegistration[]> {
-  const live = await liveDevObserveGrants(now);
-  return live.map((grant) => ({
-    id: devObserveScriptId(grant.conversationId),
-    matches: [`${grant.origin}/*`],
-    js: [{ code: devObserveCode({ token: grant.token }) }],
-    runAt: "document_start",
-    world: "MAIN",
-  }));
+export async function devObserveOrigins(now = Date.now()): Promise<string[]> {
+  const origins: string[] = [];
+  for (const grant of await liveDevObserveGrants(now)) {
+    if (!origins.includes(grant.origin)) origins.push(grant.origin);
+  }
+  return origins;
 }
 
 /**

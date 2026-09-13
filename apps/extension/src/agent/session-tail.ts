@@ -1,15 +1,15 @@
 // Reading a resumed conversation's tail for the ONE obligation the in-memory
 // contract cannot carry across a runtime death: a write_remixlet that
-// activated (reloading the tab) but was never verified. On the in-page drawer
-// surface (Arc), that reload destroys the iframe hosting the agent runtime —
-// the turn dies right after the activation's tool result is persisted, before
-// the model is re-invoked to run assert_page_state. #pendingVerification lives
-// only in memory, so it dies too, and the resumed conversation would otherwise
-// treat the broken activation as finished. This detector recovers the
-// obligation from the persisted history so the contract can re-arm it and the
-// panel can drive the verify-or-fix continuation. (A real side panel survives
-// the reload and never needs this; the Instagram v1 spinner was exactly an
-// Arc-drawer turn severed here.)
+// activated (reloading the tab) but was never verified. If the panel dies
+// right after the activation's tool result is persisted — closed by the user,
+// killed with the browser — the model is never re-invoked to run
+// assert_page_state. #pendingVerification lives only in memory, so it dies
+// too, and the resumed conversation would otherwise treat the broken
+// activation as finished. This detector recovers the obligation from the
+// persisted history so the contract can re-arm it and the panel can drive the
+// verify-or-fix continuation. (The Instagram v1 spinner was exactly such a
+// severed turn, on the since-removed in-page drawer surface whose host-tab
+// reload killed the panel itself.)
 
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import { Type } from "typebox";

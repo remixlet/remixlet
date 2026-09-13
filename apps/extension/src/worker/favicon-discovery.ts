@@ -5,12 +5,10 @@
 // entries with a sizes list), so this module fetches the site's own HTML and
 // picks the largest declared icon; the tab-reported URL stays as fallback.
 //
-// The HTML fetch is credential-free — icon declarations are public markup,
-// and the logged-out page declares the same ones — and capped: reading stops
-// at </head> or MAX_HTML_BYTES, whichever comes first.
+// The HTML fetch is credential-free and held to the page's exact origin by
+// the shared privileged-fetch boundary.
 
-const MAX_HTML_BYTES = 256 * 1024;
-const FETCH_TIMEOUT_MS = 10_000;
+import { fetchPageHtml } from "../platform/privileged-fetch.js";
 
 /**
  * Below this declared size the discovered icon is no improvement over the
@@ -78,42 +76,19 @@ export function bestIconUrl(html: string, baseUrl: string): string | undefined {
 }
 
 /**
- * Fetch `https://host/` and return the largest icon URL its HTML declares,
+ * Fetch the root of `pageOrigin` and return the largest icon URL its HTML declares,
  * or undefined on any failure — discovery is best-effort decoration, callers
- * always have a fallback. Redirects are followed (site keys are www-stripped;
- * `response.url` is the post-redirect base for relative hrefs).
+ * always have a fallback. Redirects are followed only while they remain on
+ * that origin; `response.url` is the post-redirect base for relative hrefs.
  */
-export async function discoverIconUrl(host: string): Promise<string | undefined> {
-  let response: Response;
+export async function discoverIconUrl(pageOrigin: string): Promise<string | undefined> {
+  let response: Awaited<ReturnType<typeof fetchPageHtml>>;
   try {
-    response = await fetch(`https://${host}/`, {
-      credentials: "omit",
-      signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
-    });
+    response = await fetchPageHtml(pageOrigin);
   } catch {
     return undefined;
   }
-  const type = response.headers.get("content-type")?.split(";")[0]?.trim() ?? "";
-  if (!response.ok || response.body === null || type !== "text/html") {
-    await response.body?.cancel().catch(() => undefined);
-    return undefined;
-  }
-  const reader = response.body.getReader();
-  const decoder = new TextDecoder();
-  let html = "";
-  let received = 0;
-  try {
-    while (received < MAX_HTML_BYTES) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      received += value.length;
-      html += decoder.decode(value, { stream: true });
-      if (html.includes("</head")) break;
-    }
-  } catch {
-    // Keep whatever arrived; a truncated head still lists its icons.
-  } finally {
-    void reader.cancel().catch(() => undefined);
-  }
-  return bestIconUrl(html, response.url || `https://${host}/`);
+  const type = response.headers.find(([name]) => name === "content-type")?.[1].split(";")[0]?.trim() ?? "";
+  if (response.status !== 200 || type !== "text/html") return undefined;
+  return bestIconUrl(response.content, response.url || `${pageOrigin}/`);
 }

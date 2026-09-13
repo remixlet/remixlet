@@ -64,9 +64,12 @@ function StatTile({ label, value }: { label: string; value: number }) {
 
 export function DashboardPage({
   entries,
+  quarantined,
   siteIcons,
 }: {
   entries: RegistryEntry[] | undefined;
+  /** Enabled artifacts the worker refuses to run, id → reason. */
+  quarantined: Record<string, string>;
   siteIcons: Record<string, string> | undefined;
 }) {
   const [usage, setUsage] = useState<Record<string, UsageRecord> | undefined>(undefined);
@@ -206,7 +209,7 @@ export function DashboardPage({
                       <span className="block truncate text-sm">{entry.name}</span>
                       <span className="block truncate text-xs text-muted-foreground">{entry.siteKey}</span>
                     </span>
-                    {entry.state !== "enabled" && (
+                    {entry.state !== "enabled" ? (
                       <Badge
                         variant="outline"
                         className={cn(
@@ -216,7 +219,15 @@ export function DashboardPage({
                       >
                         {entry.state === "needs-attention" ? "needs attention" : entry.state}
                       </Badge>
-                    )}
+                    ) : quarantined[entry.id] !== undefined ? (
+                      <Badge
+                        variant="outline"
+                        className="entry-quarantined shrink-0 border-[var(--signal)]/40 text-[var(--signal)]"
+                        title={quarantined[entry.id]}
+                      >
+                        not running
+                      </Badge>
+                    ) : null}
                     <SparkAreaChart
                       className="h-8 w-24 shrink-0"
                       data={spark}

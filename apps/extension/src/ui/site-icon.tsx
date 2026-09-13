@@ -3,19 +3,18 @@
 // way. Composite keys (a.com+b.com, from multi-host match patterns) borrow
 // the first part that has a snapshot; chats record icons per single host.
 //
-// Two ways a missing icon gets filled in:
+// Two ways an icon slot gets filled in:
 // - List slots (control center, history) pass the preloaded `icons` map.
-//   Rendering the globe when that map has loaded means the first capture
-//   never landed, so the slot asks the worker for one re-capture
-//   (siteIcon.refresh) and swaps the icon in if it arrives.
+//   Rendering the globe when that map has loaded asks the worker only for an
+//   already-stored snapshot. A list has no live page origin, so it cannot
+//   authorize a new fetch.
 // - Live slots (the panel's start-here preview and Working-on bar) pass
 //   `eager` — no preloaded map, capture starts on first render. With a
 //   tab-reported `favIconUrl` at hand the slot records it first
 //   (siteIcon.record, which also runs high-res discovery), then reads the
 //   stored snapshot back.
 // Either way the arriving icon fades in over the globe. One in-flight
-// request per site key per document; the worker additionally caps refresh
-// attempts per its lifetime.
+// request runs per site key and page origin in each document.
 
 import { Globe } from "lucide-react";
 import { useEffect, useState } from "react";
@@ -35,17 +34,17 @@ export function siteIconFor(icons: Record<string, string> | undefined, siteKey: 
 
 const captureRequests = new Map<string, Promise<string | undefined>>();
 
-function requestCapture(siteKey: string, favIconUrl: string | undefined): Promise<string | undefined> {
+function requestCapture(siteKey: string, pageOrigin: string | undefined, favIconUrl: string | undefined): Promise<string | undefined> {
   // Keyed on the URL too: a tab that finishes loading mid-capture reports its
   // favicon late, and that better-informed attempt deserves its own request
   // (the worker short-circuits repeats by reported URL, so this stays cheap).
-  const requestKey = `${siteKey}\n${favIconUrl ?? ""}`;
+  const requestKey = `${siteKey}\n${pageOrigin ?? ""}\n${favIconUrl ?? ""}`;
   let pending = captureRequests.get(requestKey);
   if (pending === undefined) {
     const recorded =
-      favIconUrl === undefined
+      favIconUrl === undefined || pageOrigin === undefined
         ? Promise.resolve()
-        : send({ kind: "siteIcon.record", siteKey, favIconUrl }, "siteIcon.recorded").then(
+        : send({ kind: "siteIcon.record", siteKey, pageOrigin, favIconUrl }, "siteIcon.recorded").then(
             () => undefined,
             () => undefined,
           );
@@ -61,12 +60,15 @@ function requestCapture(siteKey: string, favIconUrl: string | undefined): Promis
 export function SiteIcon({
   icons,
   siteKey,
+  pageOrigin,
   favIconUrl,
   eager = false,
   className,
 }: {
   icons?: Record<string, string> | undefined;
   siteKey: string;
+  /** Exact origin of the live tab. Absent in stored-list views, which never fetch. */
+  pageOrigin?: string;
   /** The tab-reported favicon URL, when a live tab is at hand to ask. */
   favIconUrl?: string;
   /** Capture on first render instead of waiting for the `icons` map to load. */
@@ -81,13 +83,13 @@ export function SiteIcon({
   useEffect(() => {
     if (!missing) return;
     let cancelled = false;
-    void requestCapture(siteKey, favIconUrl).then((dataUrl) => {
+    void requestCapture(siteKey, pageOrigin, favIconUrl).then((dataUrl) => {
       if (!cancelled && dataUrl !== undefined) setRecaptured({ siteKey, dataUrl });
     });
     return () => {
       cancelled = true;
     };
-  }, [missing, siteKey, favIconUrl]);
+  }, [missing, siteKey, pageOrigin, favIconUrl]);
   const src = stored ?? (recaptured?.siteKey === siteKey ? recaptured.dataUrl : undefined);
   if (src === undefined) {
     return <Globe className={cn("size-4 shrink-0 text-muted-foreground/50", className)} aria-hidden />;

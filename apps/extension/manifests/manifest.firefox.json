@@ -4,11 +4,11 @@
     "type": "module"
   },
   "permissions": [
+    "declarativeNetRequest",
     "notifications",
     "webRequestBlocking",
     "webRequestFilterResponse"
   ],
-  "optional_permissions": ["userScripts"],
   "sidebar_action": {
     "default_title": "Remixlet",
     "default_panel": "panel/index.html",

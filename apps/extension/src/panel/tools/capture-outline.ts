@@ -238,16 +238,23 @@ function formsSection(doc: Document, caps: OutlineCaps): string[] {
   return lines;
 }
 
-function dataAttrSection(doc: Document, caps: OutlineCaps): string[] {
+function dataAttrSection(doc: Document, caps: OutlineCaps, exclude: ReadonlySet<string>): string[] {
   // Frequency table of data-* attribute NAMES — pages that key their content
   // on data-testid/data-id expose their query surface here in a few lines.
+  // Leftover marks (shared/marks.ts) are excluded: they have their own
+  // section, and a hotspot line would present them as the page's data.
   const counts = new Map<string, { count: number; example: string }>();
   const all = doc.querySelectorAll("*");
   const limit = Math.min(all.length, caps.maxElements);
+  let excluded = 0;
   for (let index = 0; index < limit; index += 1) {
     const element = all[index]!;
     for (const attr of element.getAttributeNames()) {
       if (!attr.startsWith("data-")) continue;
+      if (exclude.has(attr)) {
+        excluded += 1;
+        continue;
+      }
       const existing = counts.get(attr);
       if (existing) {
         existing.count += 1;
@@ -257,26 +264,42 @@ function dataAttrSection(doc: Document, caps: OutlineCaps): string[] {
       }
     }
   }
-  if (counts.size === 0) return [];
+  if (counts.size === 0 && excluded === 0) return [];
   const top = [...counts.entries()].sort((a, b) => b[1].count - a[1].count).slice(0, caps.maxDataAttrs);
   const lines = ["", `### Data-attribute hotspots (${counts.size} distinct data-* names)`];
   for (const [name, { count, example }] of top) {
     lines.push(`- ${name} ×${count} — e.g. ${example}`);
   }
+  if (excluded > 0) lines.push(`- (${excluded} leftover data-rmx-* attributes not counted here; see Leftover marks)`);
   return lines;
+}
+
+/** Parse a captured DOM string; undefined when it cannot be parsed. Document contexts only (DOMParser). */
+export function parseCaptureDom(dom: string): Document | undefined {
+  try {
+    return new DOMParser().parseFromString(dom, "text/html");
+  } catch {
+    return undefined;
+  }
+}
+
+export interface OutlineOptions {
+  /** data-* attribute names left out of the hotspot table (the capture's leftover marks). */
+  excludeDataAttrs?: ReadonlySet<string>;
 }
 
 /**
  * The structure outline over a full (uncapped) DOM string. Pure given the
  * string; uses DOMParser, so document contexts only — never the worker.
  */
-export function buildDomOutline(dom: string, caps: OutlineCaps = DEFAULT_OUTLINE_CAPS): string {
-  let doc: Document;
-  try {
-    doc = new DOMParser().parseFromString(dom, "text/html");
-  } catch {
-    return "(outline unavailable: the captured DOM could not be parsed)";
-  }
+export function buildDomOutline(dom: string, caps: OutlineCaps = DEFAULT_OUTLINE_CAPS, options: OutlineOptions = {}): string {
+  const doc = parseCaptureDom(dom);
+  if (doc === undefined) return "(outline unavailable: the captured DOM could not be parsed)";
+  return outlineDocument(doc, dom.length, caps, options);
+}
+
+/** The outline over an already-parsed capture (the census parsed it first); `chars` is the source string's length. */
+export function outlineDocument(doc: Document, chars: number, caps: OutlineCaps = DEFAULT_OUTLINE_CAPS, options: OutlineOptions = {}): string {
   const root = doc.body ?? doc.documentElement;
   if (!root) return "(outline unavailable: the captured DOM has no body)";
 
@@ -285,7 +308,7 @@ export function buildDomOutline(dom: string, caps: OutlineCaps = DEFAULT_OUTLINE
   const totalElements = doc.querySelectorAll("*").length;
 
   const parts: string[] = [
-    `Full DOM: ${dom.length} chars, ${totalElements} elements. Outline of landmarks, headings, and repeated items` +
+    `Full DOM: ${chars} chars, ${totalElements} elements. Outline of landmarks, headings, and repeated items` +
       ` (selectors are probe-ready; "×N" = N same-shaped siblings, itemized once):`,
     ...(state.lines.length > 0 ? state.lines : ["(no landmark/heading structure found)"]),
   ];
@@ -293,7 +316,7 @@ export function buildDomOutline(dom: string, caps: OutlineCaps = DEFAULT_OUTLINE
     parts.push(`(outline truncated at ${state.lines.length} lines — deeper structure not shown)`);
   }
   parts.push(...formsSection(doc, caps));
-  parts.push(...dataAttrSection(doc, caps));
+  parts.push(...dataAttrSection(doc, caps, options.excludeDataAttrs ?? new Set()));
   return parts.join("\n");
 }
 
@@ -303,7 +326,10 @@ export function buildDomOutline(dom: string, caps: OutlineCaps = DEFAULT_OUTLINE
  * which is replaced by the structure outline plus honest size facts and
  * drill-down directions.
  */
-export function formatCaptureOrientationForModel(bundle: CaptureBundle): string {
+export function formatCaptureOrientationForModel(
+  bundle: CaptureBundle,
+  options: OutlineOptions & { parsed?: Document } = {},
+): string {
   const { dom, ...rest } = bundle;
   const base = formatCaptureForModel(rest);
   if (dom === undefined) return base;
@@ -311,7 +337,9 @@ export function formatCaptureOrientationForModel(bundle: CaptureBundle): string 
     base,
     "",
     "## DOM (outline — raw DOM not included)",
-    buildDomOutline(dom),
+    options.parsed === undefined
+      ? buildDomOutline(dom, DEFAULT_OUTLINE_CAPS, options)
+      : outlineDocument(options.parsed, dom.length, DEFAULT_OUTLINE_CAPS, options),
     "",
     `The raw DOM (${dom.length} chars) was not sent. To reach any part of it, probe the LIVE page: ` +
       `search_elements finds where text lives when you have no selector yet; query_elements/inspect_element ` +

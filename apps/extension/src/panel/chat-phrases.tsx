@@ -16,6 +16,7 @@ import {
   Braces,
   Bug,
   CircleDashed,
+  CirclePause,
   CircleX,
   Compass,
   Crosshair,
@@ -30,14 +31,13 @@ import {
   Search,
   ShieldCheck,
   Tags,
-  Terminal,
   Undo2,
   WandSparkles,
   type LucideIcon,
 } from "lucide-react";
 
 import { classifyToolFailure, isContractNudgePrompt, type SessionTranscriptItem } from "../agent/index.js";
-import type { AgentRuntimeEvent } from "../agent/types.js";
+import type { AgentRuntimeEvent, ModelWaitEvent } from "../agent/types.js";
 import { Type } from "typebox";
 import { Check, Parse } from "typebox/value";
 import {
@@ -50,8 +50,9 @@ import {
 export type MessageKind = "user" | "assistant" | "tool" | "error";
 // Activity rows (kind "tool") carry an icon and the state it's in; the state
 // only ever changes the icon's colour, never the `msg <kind>` className the
-// conversation suite reads.
-export type ActivityState = "active" | "done" | "failed";
+// conversation suite reads. "held" is a step the contract bounced: it waited
+// for an earlier step, and the row says which in plain words.
+export type ActivityState = "active" | "done" | "failed" | "held";
 
 export interface ToolPhrase {
   active: string;
@@ -65,9 +66,61 @@ type ToolEndDetails = Extract<AgentRuntimeEvent, { kind: "tool_end" }>["details"
 
 // Failure is the one state that DOES override the tool's own icon: it's rare,
 // and being unmistakable matters more there than being specific. HELD_ICON
-// remains for the finish-check action row.
+// remains for the finish-check action row; BOUNCED_ICON marks a step the
+// contract held (the pause says "waited", where the tool's own icon would
+// claim the step happened).
 export const FAILED_ICON = CircleX;
 export const HELD_ICON = Undo2;
+export const BOUNCED_ICON = CirclePause;
+
+// A contract bounce (tool-errors.ts): the extension held a step because an
+// earlier one had not happened yet, and the agent redoes the order. The user
+// reads it as one calm line in the flow. It has to be readable: on the
+// 2026-09-09 SoundCloud run two bounced writes each cost a full ~40 s
+// regeneration and, dropped from the chat, made the visible verification
+// steps look like the slow part. An earlier design showed a red icon with no
+// words, which alarmed without explaining; a plain sentence with the reason
+// is what a person can actually use. The raw contract text is harness-to-
+// agent choreography (tool names, prescribed recoveries) and never renders.
+//
+// Each contract family gets its own words, keyed on a stable fragment of the
+// message contracts.ts throws. Write bounces say "held"/"paused" rather than
+// "rejected": a held write is re-submitted, and the words stay true whether
+// the model resends the files or only asks for them to go through. Nothing
+// here names a capability or a remixlet id — the hostile-page case bounces
+// on an attacker-chosen capability, and its name must not reach the chat.
+export const BOUNCE_FALLBACK_TEXT = "Paused a step until an earlier one is done";
+const BOUNCE_PHRASES: readonly { needle: string; text: string }[] = [
+  // write_remixlet (contracts.ts #assertWriteAllowed), in check order.
+  { needle: "list_remixlets must succeed before write_remixlet", text: "Held the write for a moment: existing remixlets have to be checked first" },
+  { needle: "capture_page must successfully capture the page before write_remixlet", text: "Held the write for a moment: the page needs a fresh look first" },
+  { needle: "has no user grant behind it", text: "Held the write until you decide on the access below" },
+  { needle: "has not been granted by the user", text: "Held the write until you decide on the access below" },
+  { needle: "read_remixlet must succeed for existing remixlet", text: "Held the write for a moment: the existing remixlet has to be read before it's changed" },
+  { needle: "assess_feasibility must succeed before write_remixlet", text: "Held the write for a moment: whether this is possible has to be checked first" },
+  { needle: "read_remixlet_logs has not run since that failure", text: "Paused the rewrite: the runtime log has to be read after that failed check" },
+  { needle: "the logs since the failure are empty", text: "Paused the rewrite: the next version has to record what it does, so the failure can be traced" },
+  { needle: "no inspect_design ran this turn", text: "Held the write for a moment: the page's own styling has to be looked at before adding a control" },
+  { needle: 'verdict was "infeasible"', text: "Held the write: the check found this isn't possible on this page, so nothing gets built on a guess" },
+  { needle: 'verdict was "needs-network-visibility"', text: "Held the write: the data the page loads has to be seen first" },
+  // write_remixlet shape checks (contracts.ts parseWriteTarget): an incomplete file set.
+  { needle: "write_remixlet files are missing", text: "Held the write: the file set was incomplete, so it's being redone" },
+  { needle: "write_remixlet must include", text: "Held the write: the file set was incomplete, so it's being redone" },
+  { needle: "remixlet.json is not valid JSON", text: "Held the write: the file set was incomplete, so it's being redone" },
+  { needle: "remixlet.json has no id", text: "Held the write: the file set was incomplete, so it's being redone" },
+  { needle: "capabilities must be an array", text: "Held the write: the file set was incomplete, so it's being redone" },
+  // assess_feasibility.
+  { needle: "assess_feasibility must run after observing the page", text: "Held the feasibility check for a moment: the page has to be looked at first" },
+  { needle: "Refused: the evidence cites", text: "Held the feasibility check: it leaned on a leftover mark from an old remixlet, not on the page itself" },
+  // record_look.
+  { needle: "record_look must follow a look_at_change", text: "Held the note for a moment: the new control has to be looked at first" },
+];
+
+/** The plain-words line for a bounced step, from the contract's own message; never the message itself. */
+export function bouncePhrase(reason: string | undefined): string {
+  if (reason === undefined) return BOUNCE_FALLBACK_TEXT;
+  return BOUNCE_PHRASES.find((entry) => reason.includes(entry.needle))?.text ?? BOUNCE_FALLBACK_TEXT;
+}
 
 // A pre-activation safety review sent a draft back: nothing was saved, the
 // page is untouched, and the agent writes a new version in the same turn.
@@ -87,6 +140,30 @@ export const UNFINISHED_TURN_TEXT =
   "Continuing the conversation picks this back up.";
 
 /**
+ * The running indicator's words while a model call is in flight. Nothing to
+ * say for the first seconds (the ticker beside it already counts); a call the
+ * model has kept quiet for a while says so with the wait; a retry says it is
+ * one, with the count. `detail` is the plain-words reason of a retry, shown
+ * dimmer beside the label.
+ */
+export const MODEL_WAIT_SLOW_MS = 10_000;
+export const THINKING_LABEL = "Thinking…";
+export interface TurnStatusWords {
+  label: string;
+  detail?: string;
+}
+export function modelWaitLabel(wait: ModelWaitEvent | null): TurnStatusWords {
+  if (wait === null || wait.phase === "done") return { label: THINKING_LABEL };
+  if (wait.phase === "retrying") {
+    return { label: `Connection trouble, retrying (${wait.attempt} of ${wait.maxAttempts})…`, detail: wait.reason };
+  }
+  if (wait.silenceMs >= MODEL_WAIT_SLOW_MS) {
+    return { label: `Still waiting for the model (${Math.round(wait.silenceMs / 1000)}s)` };
+  }
+  return { label: THINKING_LABEL };
+}
+
+/**
  * What a turn-level run error shows in chat: contract text (classified from
  * the message the same way stored tool failures are) becomes the plain
  * unfinished-turn words; anything else — provider errors, setup failures — is
@@ -100,27 +177,31 @@ export function runErrorDisplayText(message: string): string {
 // what they chose and where that leaves things, in a settled (never red) row.
 function declinedText(toolName: string): string {
   if (toolName === "write_remixlet") return "You declined the extra access — the previous version stays active";
-  if (toolName === "evaluate_js") return "You chose not to run that script";
   return "You declined this step";
 }
 
 /**
  * How a settled tool call renders, given the failure classification carried on
  * the tool_end event (live) or recovered from the stored result text (replay).
- * Returns undefined for a contract bounce: the extension holding a step until
- * its prerequisites ran is harness-to-agent choreography the agent remedies
- * within seconds — showing it only reads as something going wrong, so the
- * step's row is dropped and the user sees the corrected order instead.
+ * A contract bounce settles as a muted "held" row saying why the step waited
+ * (bouncePhrase); `reason` is the contract's own message, live or stored.
  */
 export function settledToolMessage(
   toolName: string,
   phrase: ToolPhrase,
-  outcome: { ok: boolean; bounced?: boolean; gateRejected?: boolean; declined?: boolean; details?: ToolEndDetails },
-): TranscriptMessage | undefined {
+  outcome: {
+    ok: boolean;
+    bounced?: boolean;
+    reason?: string;
+    gateRejected?: boolean;
+    declined?: boolean;
+    details?: ToolEndDetails;
+  },
+): TranscriptMessage {
   if (outcome.ok) {
     return { kind: "tool", text: refineDonePhrase(toolName, phrase, outcome.details), icon: phrase.icon, state: "done" };
   }
-  if (outcome.bounced) return undefined;
+  if (outcome.bounced) return { kind: "tool", text: bouncePhrase(outcome.reason), icon: BOUNCED_ICON, state: "held" };
   if (outcome.gateRejected) return { kind: "tool", text: SAFETY_GATE_TEXT, icon: ShieldCheck, state: "done" };
   if (outcome.declined) return { kind: "tool", text: declinedText(toolName), icon: phrase.icon, state: "done" };
   return { kind: "tool", text: phrase.failed, icon: FAILED_ICON, state: "failed" };
@@ -128,11 +209,14 @@ export function settledToolMessage(
 
 // State is a colour on the icon, nothing else: a running step's icon pulses at
 // low contrast, a finished one takes the brand tint, a failed one goes
-// destructive. Same icon, same row geometry throughout — only the tone moves.
+// destructive, a held one stays at the row's own muted tone (it is neither an
+// achievement nor a failure). Same icon, same row geometry throughout — only
+// the tone moves.
 export const ACTIVITY_ICON_TONE = {
   active: "animate-pulse text-muted-foreground/60",
   done: "text-primary",
   failed: "text-destructive",
+  held: "text-muted-foreground",
 } satisfies Record<ActivityState, string>;
 
 export function hostOf(url: string | undefined): string {
@@ -157,6 +241,8 @@ interface ToolArguments {
   archive?: boolean;
   code?: string;
   console?: boolean;
+  /** replay_network_resource's network id (r12). */
+  id?: string;
   network?: boolean;
   screenshot?: string;
   selector?: string;
@@ -167,6 +253,7 @@ const ToolArgumentsSchema = Type.Object({
   archive: Type.Optional(Type.Boolean()),
   code: Type.Optional(Type.String()),
   console: Type.Optional(Type.Boolean()),
+  id: Type.Optional(Type.String()),
   network: Type.Optional(Type.Boolean()),
   screenshot: Type.Optional(Type.String()),
   selector: Type.Optional(Type.String()),
@@ -174,7 +261,26 @@ const ToolArgumentsSchema = Type.Object({
 });
 const ToolOutcomeDetailsSchema = Type.Object({
   verificationSucceeded: Type.Optional(Type.Boolean()),
-  verdict: Type.Optional(Type.Union([Type.Literal("feasible"), Type.Literal("feasible-with-capability"), Type.Literal("partial"), Type.Literal("infeasible")])),
+  // click_element's outcome: a click the page-side policy refused dispatched
+  // nothing, and the row says so instead of claiming the control was tried.
+  clicked: Type.Optional(Type.Boolean()),
+  refused: Type.Optional(Type.String()),
+  // assess_feasibility's verdicts and record_look's share the field name;
+  // refineDonePhrase reads it per tool.
+  verdict: Type.Optional(
+    Type.Union([
+      Type.Literal("feasible"),
+      Type.Literal("feasible-with-capability"),
+      Type.Literal("partial"),
+      Type.Literal("infeasible"),
+      Type.Literal("matches"),
+      Type.Literal("differs"),
+      Type.Literal("wrong-kind"),
+      Type.Literal("not-reviewable"),
+    ]),
+  ),
+  observed: Type.Optional(Type.String()),
+  screenshotDiscarded: Type.Optional(Type.Boolean()),
 });
 
 function describeCapture(args: ToolArguments): string {
@@ -186,14 +292,6 @@ function describeCapture(args: ToolArguments): string {
   return joinHuman(parts);
 }
 
-// evaluate_js is a page probe; the CSS selector it queries is the most telling
-// "what is it looking for". Surface that when the code is a simple query,
-// otherwise stay generic rather than showing raw JavaScript.
-function describeProbe(code: string | undefined): string {
-  if (code === undefined) return "";
-  const match = code.match(/querySelector(?:All)?\(\s*['"`]([^'"`]+)['"`]/);
-  return match ? `looking for “${match[1]}” on the page` : "";
-}
 
 // The structured probes carry their selector as a plain argument — no code
 // parsing needed to say what the step is looking at.
@@ -275,9 +373,9 @@ export function describeTool(toolName: string, args: ToolInput): ToolPhrase {
         icon: Network,
       };
     case "replay_network_resource": {
-      const host = hostOf(a.url);
+      const id = a.id !== undefined && /^r\d+$/.test(a.id) ? a.id : "";
       return {
-        active: host ? `Re-checking data the page loaded from ${host}` : "Re-checking data the page loaded",
+        active: id ? `Re-checking data the page loaded (${id})` : "Re-checking data the page loaded",
         done: "Re-checked data the page loaded",
         failed: "Couldn't re-check that data",
         icon: Repeat2,
@@ -289,6 +387,21 @@ export function describeTool(toolName: string, args: ToolInput): ToolPhrase {
         done: "Read the data the page loaded",
         failed: "Couldn't read the data the page loaded",
         icon: Network,
+      };
+    case "look_at_change":
+      return {
+        active: `Looking at the new control next to the page's own${describeSelector(a.selector)}`,
+        done: "Looked at the new control next to the page's own",
+        failed: "Couldn't get a picture of the new control",
+        icon: Eye,
+      };
+    case "record_look":
+      // Neutral by default: refineDonePhrase says what the look concluded.
+      return {
+        active: "Noting what it looks like",
+        done: "Noted what it looks like",
+        failed: "Couldn't note what it looks like",
+        icon: Eye,
       };
     case "click_element":
       return {
@@ -314,15 +427,6 @@ export function describeTool(toolName: string, args: ToolInput): ToolPhrase {
         failed: "Couldn't read the remixlet's runtime log",
         icon: Bug,
       };
-    case "evaluate_js": {
-      const probe = describeProbe(a.code);
-      return {
-        active: probe ? `Running an approved script — ${probe}` : "Running an approved script",
-        done: probe ? `Checked the page — ${probe}` : "Checked the page",
-        failed: "Couldn't run that script",
-        icon: Terminal,
-      };
-    }
     case "assess_feasibility":
       return {
         active: "Checking whether this is possible on this page",
@@ -353,7 +457,17 @@ export function describeTool(toolName: string, args: ToolInput): ToolPhrase {
 // feasibility step surfaces its verdict instead of a generic "done".
 export function refineDonePhrase(toolName: string, phrase: ToolPhrase, details: ToolEndDetails): string {
   const d = Check(ToolOutcomeDetailsSchema, details) ? Parse(ToolOutcomeDetailsSchema, details) : {};
+  if ((toolName === "capture_page" || toolName === "look_at_change") && d.screenshotDiscarded === true) {
+    return "Skipped a screenshot because the active tab or page changed while it was being taken";
+  }
   if (toolName === "assert_page_state" && d.verificationSucceeded === true) return "Confirmed the remixlet worked";
+  if (toolName === "click_element" && d.refused !== undefined) return "Didn't click that control: it would have left this site";
+  if (toolName === "record_look") {
+    if (d.verdict === "matches") return "Looked at it — reads as the page's own";
+    if (d.verdict === "differs") return d.observed ? `Looked at it — ${d.observed}` : "Looked at it — spotted a difference";
+    if (d.verdict === "wrong-kind") return "Looked at it — wrong kind of control, rebuilding";
+    if (d.verdict === "not-reviewable") return "Couldn't check the look by eye";
+  }
   if (toolName === "assess_feasibility") {
     if (d.verdict === "feasible") return "Checked what's possible — this is doable on this page";
     if (d.verdict === "feasible-with-capability") return "Checked what's possible — doable with extra access you'd approve";
@@ -385,19 +499,19 @@ export function MessageBody({ message }: { message: TranscriptMessage }) {
 }
 
 /**
- * How a stored transcript item renders back into the chat — or undefined for
- * rows the live chat would not have kept (contract bounces). A persisted grant
+ * How a stored transcript item renders back into the chat. A persisted grant
  * continuation (marker prefix) renders as the action row the click originally
  * produced, never as a user bubble — the click was an action, not something
  * typed. Shared by the panel's resume paths and the control center's read-only
  * chat view.
  */
-export function transcriptMessage(item: SessionTranscriptItem): TranscriptMessage | undefined {
+export function transcriptMessage(item: SessionTranscriptItem): TranscriptMessage {
   if (item.kind === "tool") {
     const phrase = describeTool(item.toolName, undefined);
     return settledToolMessage(item.toolName, phrase, {
       ok: item.ok,
       bounced: item.failure === "bounced",
+      reason: item.reason,
       gateRejected: item.failure === "gate",
       declined: item.failure === "declined",
     });

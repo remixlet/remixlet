@@ -8,28 +8,30 @@ import { ext } from "../../platform/ext.js";
 import type { CapabilityApprovalProposal } from "../../worker/activation.js";
 import { capabilityPageHostWarning, isKnownCapabilityName } from "../capability-request.js";
 import { MANIFEST_FILE, stampManifestBuiltWith } from "../../shared/remixlet.js";
-import { siteKeyForUrl, siteKeyPaused } from "../../shared/site-key.js";
-import { formatScriptLogLines } from "../../shared/script-log.js";
+import { remixletOnSite, siteKeyForUrl } from "../../shared/site-key.js";
+import { READ_REMIXLET_LOGS_MAX_LINES, formatScriptLogLines } from "../../shared/script-log.js";
 import type { RegistryEntry } from "../../store/remixlet-store.js";
 import { capturePageTool } from "./capture-page.js";
 import { formatRemixletFiles } from "./format.js";
 import { assertNoRemoteCodeLoading } from "./remote-code-safety.js";
 import { frameUntrustedPageData, pageProbeTools } from "./page-probes.js";
+import { lookReviewTools, type LookReviewDeps } from "./look-review.js";
 import type { TabBinding } from "../tab-binding.js";
 import { sendRaw, sendToWorker } from "../worker-client.js";
 
 export interface ToolApprovalDeps {
   confirmCapabilityApproval(proposal: CapabilityApprovalProposal): Promise<boolean>;
-  /**
-   * The evaluate_js gate: show the model-authored script to the user and
-   * resolve true only on an explicit click. Per-call, never per-conversation —
-   * the structured probes absorb the volume, and frequent dialogs are the
-   * signal a probe is missing.
-   */
-  confirmScriptEvaluation(request: { code: string; host: string }): Promise<boolean>;
 }
 
-export function buildTools(deps: ToolApprovalDeps, conversationId: string, tabs: TabBinding): AgentToolSpec<never>[] {
+export function buildTools(
+  deps: ToolApprovalDeps,
+  conversationId: string,
+  tabs: TabBinding,
+  // The look review's one panel fact: which remixlet this turn activated, so
+  // the worker can store the crop beside it. Optional so tests and detached
+  // belts need not supply it — the look then runs without storing.
+  lookReview: LookReviewDeps = { activatedRemixletId: () => undefined },
+): AgentToolSpec<never>[] {
   // One id per tool belt = one per conversation runtime (the panel builds a
   // fresh belt whenever it opens or resumes a conversation). It scopes the
   // worker's unchanged-page capture short-circuit: "you already have this
@@ -44,18 +46,21 @@ export function buildTools(deps: ToolApprovalDeps, conversationId: string, tabs:
   const tools = [
     capturePageTool({
       target: () => tabs.target(),
-      requestCapture: async (request) => {
-        const reply = await sendToWorker({ kind: "capture.request", request, conversationEpoch }, "capture.result");
+      // Every stored id, whatever its state: a disabled or archived
+      // remixlet's marks are its own, not leftovers.
+      installedRemixletIds: async () => (await sendToWorker({ kind: "remixlet.list" }, "remixlet.listed")).entries.map((entry) => entry.id),
+      requestCapture: async (request, page) => {
+        const reply = await sendToWorker({ kind: "capture.request", request, conversationEpoch, page }, "capture.result");
         return { result: reply.result, ref: reply.ref, unchangedSince: reply.unchangedSince };
       },
     }),
     ...pageProbeTools(conversationId, tabs),
+    ...lookReviewTools(tabs, lookReview),
     assessFeasibilityTool(tabs),
     writeRemixletTool(deps, seenRemixletShas, tabs, conversationId),
     listRemixletsTool(tabs),
-    readRemixletTool(seenRemixletShas),
+    readRemixletTool(seenRemixletShas, tabs),
     readRemixletLogsTool,
-    evaluateJsTool(deps, tabs),
     navigateTool(tabs),
   ];
   // SAFETY: every entry above is an AgentToolSpec with no direct tool parameters.
@@ -79,23 +84,18 @@ const assessFeasibilityTool = (tabs: TabBinding): AgentToolSpec<AssessFeasibilit
   name: "assess_feasibility",
   label: "Assess feasibility",
   description:
-    "Record whether the request is actually implementable with the data this page exposes. Required after observing " +
-    "the page and before write_remixlet. \"feasible\": achievable with what the page already exposes (DOM, embedded " +
-    "state) and no new capabilities. \"feasible-with-capability\": the data exists but reaching it needs a named " +
-    "capability (e.g. fetch:<host> to replay a discovered endpoint, network:observe:<host> to read API responses as " +
-    "they arrive) — name it in \"capabilities\"; the build proceeds normally and the user approves the capability at " +
-    "activation. \"needs-network-visibility\": the data plainly arrives over the network but NO candidate endpoint " +
-    "could be verified — replay returned an auth failure or a body without the field, or the request is a POST replay " +
-    "cannot re-issue — so naming a host now would be a guess. Record this instead of guessing: it blocks building and " +
-    "asks the user (via a panel card, never typed text) to let the agent watch the data this page loads for the rest " +
-    "of this conversation; after the grant, read the observed responses with observe_network_bodies and record a " +
-    "fresh verdict naming the ONE host that really carries the field. " +
-    "\"partial\": a meaningful subset of the named elements is directly achievable — name the subset. " +
-    "\"infeasible\": the data truly never reaches the client in usable form (canvas/WebGL-drawn items, closed shadow " +
-    "roots, cross-origin frames) — only record this after walking the whole ladder (DOM → embedded/structured state → " +
-    "page state → network endpoint discovery + replay), and name in \"evidence\" which rungs you checked so a wrong " +
-    "verdict is diagnosable. \"Not in the DOM\" alone is never \"infeasible\". Remixing different elements than the " +
-    "user named is NOT \"partial\" — record \"infeasible\" and propose the alternative to the user instead of building it.",
+    "Record whether the request is implementable with the data this page exposes; required before write_remixlet. " +
+    "Verdicts: \"feasible\" (the page's DOM or embedded state carries it, no new capability); " +
+    "\"feasible-with-capability\" (the data exists but reaching it needs a named capability, e.g. fetch:<host> to " +
+    "replay a verified endpoint or network:observe:<host> to read responses as they arrive; list it in " +
+    "\"capabilities\"); \"needs-network-visibility\" (the data arrives over the network but no endpoint could be " +
+    "verified: replay failed or the request is a POST; record this instead of guessing a host, it asks the user " +
+    "through a panel card to let you watch the page's responses, after which observe_network_bodies finds the one " +
+    "host and a fresh verdict names it); \"partial\" (a meaningful subset of the named elements is achievable; name " +
+    "it); \"infeasible\" (the data never reaches the client in usable form: canvas/WebGL, closed shadow roots, " +
+    "cross-origin frames; only after checking DOM, embedded state, page state and network, with \"evidence\" naming " +
+    "what you checked). \"Not in the DOM\" alone is never infeasible. Different elements than the user named is not " +
+    "\"partial\": record \"infeasible\" and propose the alternative.",
   parameters: Type.Object({
     request: Type.String({ description: "The requirement being assessed, restated in your own words." }),
     verdict: Type.Union([
@@ -193,8 +193,12 @@ const assessFeasibilityTool = (tabs: TabBinding): AgentToolSpec<AssessFeasibilit
 });
 
 interface WriteRemixletParams {
-  files: { path: string; content: string }[];
+  // Optional in the schema only for the re-submit of a held file set: the
+  // contract substitutes the held files before this tool runs (contracts.ts
+  // #resolveWriteFiles), so execute() always sees them.
+  files?: { path: string; content: string }[];
   message: string;
+  activateHeld?: boolean;
 }
 
 function writeRemixletTool(
@@ -207,35 +211,48 @@ function writeRemixletTool(
   name: "write_remixlet",
   label: "Write remixlet",
   description:
-    "Write a remixlet's complete file set and activate it immediately (commits a version, registers scripts/styles, " +
-    "reloads the active tab once). Must include remixlet.json and README.md — the plain-English record of the " +
-    "remixlet's intent, behavior, page assumptions, and decisions, brought up to date with every write. To update an " +
-    "existing remixlet, send the full new file " +
-    "set with the same id — version numbers are assigned automatically on activation, never by you. Every write carries " +
-    "a commit message describing the actual change; it becomes the version's entry in the user's history. " +
-    "Capability-bearing manifests should include capabilityRationales with " +
-    "a short feature-specific reason for every capability. Files are auto-formatted with Prettier on save; a JS/CSS/JSON " +
-    "file that does not parse rejects the write. " +
-    "The change is live when this returns ok.",
+    "Write a remixlet's complete file set and activate it immediately (commits a version, registers scripts and " +
+    "styles, reloads the active tab once). Must include remixlet.json and README.md. To update an existing remixlet, " +
+    "send the full new file set with the same id; version numbers are assigned automatically on activation, never by " +
+    "you. Files are auto-formatted with Prettier on save; a JS/CSS/JSON file that does not parse rejects the write. " +
+    "The change is live when this returns ok. A write refused because a step is still missing keeps its file set " +
+    "for the rest of the turn: do the step, then call again with activateHeld instead of resending the files.",
   // Order-dependent: activation reloads the tab, so a write batched with the
   // verification calls that follow it must run in message order
   // (agent/types.ts executionMode).
   executionMode: "sequential",
   parameters: Type.Object({
-    files: Type.Array(
-      Type.Object({
-        path: Type.String({ description: "e.g. remixlet.json, main.js, style.css" }),
-        content: Type.String(),
-      }),
-      { minItems: 1 },
+    files: Type.Optional(
+      Type.Array(
+        Type.Object({
+          path: Type.String({ description: "e.g. remixlet.json, main.js, style.css" }),
+          content: Type.String(),
+        }),
+        {
+          minItems: 1,
+          description:
+            "The complete file set. Required unless activateHeld is true; sending files always replaces any held set.",
+        },
+      ),
     ),
     message: Type.String({
       description:
         'Commit message for this version: an imperative-mood subject line of at most 50 characters describing the change ' +
         '(e.g. "Hide sponsored listings"), then a blank line, then a short body explaining what changed and why.',
     }),
+    activateHeld: Type.Optional(
+      Type.Boolean({
+        description:
+          "Activate the file set held from this turn's last write that was refused for a missing step, exactly as " +
+          "sent then. Send it with a message and no files. Refused when nothing is held.",
+      }),
+    ),
   }),
   async execute(params) {
+    // The contract resolves activateHeld into the held files before the tool
+    // runs; a call reaching here without files is a programming error, not a
+    // bounce.
+    if (params.files === undefined) throw new Error("write_remixlet: files are missing.");
     // Stamp builtWith before formatting (Prettier then owns the final shape).
     // Extension-authored like the store's version stamp: the model cannot
     // forget the field and cannot fake a version it did not build against —
@@ -265,11 +282,19 @@ function writeRemixletTool(
     const files = Object.fromEntries(formatted.map((f) => [f.path, f.content]));
     // Tolerate a missing/blank message (the store falls back to "activate vN").
     const message = params.message?.trim() || undefined;
-    // A closed bound tab must not block the activation itself — the reload is
-    // simply skipped, and the next probe surfaces the closed-tab error.
-    const reloadTabId = await tabs.target().then((target) => target.tabId, () => undefined);
+    // The bound page is the site this write is authorized for: the worker
+    // holds the manifest's matches to it (wiki/ops/2026-09-04-security-remediation-plan.md
+    // item 7). The record is panel-authored from the binding; nothing the
+    // model sends reaches it. target() refuses on a CLOSED binding (the
+    // pre-existing rule: no tab, no write) and on a tab that has moved to
+    // another site — a write is held to the bound page exactly as a read is,
+    // and the worker refuses the activation again on its own reading of the
+    // live tab (worker/activation.ts).
+    const target = await tabs.target();
+    const reloadTabId = target.tabId;
+    const authorization = { siteKey: tabs.bound?.siteKey ?? "", tabId: target.tabId };
     let reply = await sendToWorker(
-      { kind: "remixlet.activate", files, message, reloadTabId, conversationId },
+      { kind: "remixlet.activate", files, message, reloadTabId, conversationId, authorization },
       "remixlet.activated",
     );
     if (!reply.outcome.ok && reply.outcome.reason === "needs-capability-approval") {
@@ -284,6 +309,7 @@ function writeRemixletTool(
             message,
             reloadTabId,
             conversationId,
+            authorization,
           },
           "remixlet.capabilityDenied",
         );
@@ -303,6 +329,7 @@ function writeRemixletTool(
           message,
           reloadTabId,
           conversationId,
+          authorization,
         },
         "remixlet.activated",
       );
@@ -322,8 +349,14 @@ function writeRemixletTool(
       reply.outcome.jsChanged === false
         ? " No script file changed from the previous version — a styles-only update, so no click cycle is owed; assert presence and look only."
         : "";
+    // A tab that moved off the site is not reloaded and is not the page to
+    // verify against; the model hears that instead of "the tab reloaded".
+    const applied =
+      reply.outcome.reloadSkipped === undefined
+        ? "the tab reloaded with it live."
+        : `${reply.outcome.reloadSkipped}. It runs on ${entry.siteKey} from the next page load there. Tell the user the tab moved, and do not verify against this tab.`;
     return {
-      text: `Activated ${entry.id} v${entry.version} (${entry.headSha.slice(0, 7)}) on ${entry.siteKey}; the tab reloaded with it live.${stylesOnly}`,
+      text: `Activated ${entry.id} v${entry.version} (${entry.headSha.slice(0, 7)}) on ${entry.siteKey}; ${applied}${stylesOnly}`,
       // The entry shape every consumer reads (verification.ts, the panel's
       // pendingVerificationRef), plus the store's jsChanged verdict the
       // contract gates the click-cycle obligation on.
@@ -347,72 +380,75 @@ function verifyResultNote(entry: RegistryEntry): string {
   return ` — verification ${label} ${result.at.slice(0, 10)}${described}${result.summary ? `: ${result.summary}` : ""}`;
 }
 
-/**
- * Why a needs-attention entry was parked when the cause was a revoke, not a
- * failed verification — the model must know which fix applies (rewrite without
- * the capability or re-declare it, never a verification retry).
- */
-function attentionNote(entry: RegistryEntry): string {
-  const attention = entry.attention;
-  if (attention?.kind !== "capability-revoked") return "";
-  return ` — the user revoked its "${attention.capability}" permission ${attention.at.slice(0, 10)}`;
-}
-
 const listRemixletsTool = (tabs: TabBinding): AgentToolSpec<Record<string, never>> => ({
   name: "list_remixlets",
   label: "List remixlets",
   description:
     "Inventory of live remixlets: id, name, state, site, version. Use before deciding refine-vs-new. Remixlets on " +
-    "the current site are listed in full; those on other sites appear as a one-line id roster (their ids are taken, " +
-    "but they are not candidates for this page).",
+    "the current site are listed in full; those on other sites are only counted (they are not candidates for this " +
+    "page, and their ids are taken, so a new id that collides is refused).",
   parameters: Type.Object({}),
   async execute() {
-    const { entries } = await sendToWorker({ kind: "remixlet.list" }, "remixlet.listed");
+    const { entries, quarantined } = await sendToWorker({ kind: "remixlet.list" }, "remixlet.listed");
     // Archived remixlets are soft-deleted: invisible to the agent until the
     // user restores them in the manager, so they can never be read or refined.
     const visible = entries.filter((e) => e.state !== "archived");
     if (visible.length === 0) return { text: "No remixlets exist yet.", details: [] };
     // Full lines only for the current site's remixlets; other sites' shrink
-    // to an id roster. `details` still carries EVERY visible entry — the
-    // contract's "modifying a listed id requires reading it first" guard
-    // reads ids from details, and must keep seeing cross-site ids so an id
-    // collision can never silently overwrite a remixlet the model never saw.
-    let currentSite: string | undefined;
-    try {
-      const { url } = await tabs.target();
-      if (url !== undefined) currentSite = siteKeyForUrl(url);
-    } catch {
-      // No tab context (tests, detached panel) — list everything in full.
+    // to a count, with no ids and no site keys: what the user built
+    // elsewhere is not this page's business, and the model-facing text is
+    // what reaches the provider. `details` still carries EVERY visible entry
+    // — the contract's "modifying a listed id requires reading it first"
+    // guard reads ids from details, and must keep seeing cross-site ids so an
+    // id collision can never silently overwrite a remixlet the model never
+    // saw (the read that guard demands is refused for another site's
+    // remixlet, which is what makes the collision a dead end).
+    // The conversation's site, taken from the binding rather than from
+    // wherever the tab is pointing right now: a moved tab must not turn "the
+    // current site" into another site's roster, and must not fall back to
+    // listing every site in full either.
+    let currentSite: string | undefined = tabs.bound?.siteKey || undefined;
+    if (currentSite === undefined) {
+      try {
+        // Only reached when the binding has no site of its own, which is also
+        // the one state target() never refuses a move against.
+        const { url } = await tabs.target();
+        if (url !== undefined) currentSite = siteKeyForUrl(url);
+      } catch {
+        // No tab context (tests, detached panel) — list everything in full.
+      }
     }
-    // siteKeyPaused is the one shared host-overlap rule (named for its pause
-    // use): it treats subdomains and composite site keys correctly, so a
-    // remixlet keyed "soundcloud.com" still lists in full on m.soundcloud.com.
-    const onSite =
-      currentSite === undefined ? visible : visible.filter((e) => siteKeyPaused(e.siteKey, [currentSite]));
+    // remixletOnSite is the one rule for "this site's remixlets", shared with
+    // the worker's read gate: it treats subdomains and composite site keys
+    // correctly, so a remixlet keyed "soundcloud.com" still lists in full on
+    // m.soundcloud.com, and what is listed here is exactly what read_remixlet
+    // will return.
+    const onSite = currentSite === undefined ? visible : visible.filter((e) => remixletOnSite(e.siteKey, currentSite));
     const elsewhere = visible.filter((e) => !onSite.includes(e));
     const lines = onSite.map(
       (e) =>
-        `- ${e.id} v${e.version} [${e.state}] "${e.name}" on ${e.siteKey} (${e.matches.join(", ")})${verifyResultNote(e)}${attentionNote(e)}`,
+        `- ${e.id} v${e.version} [${e.state}] "${e.name}" on ${e.siteKey} (${e.matches.join(", ")})${verifyResultNote(e)}` +
+        (quarantined[e.id] !== undefined ? ` — NOT RUNNING: ${quarantined[e.id]}` : ""),
     );
     if (lines.length === 0 && currentSite !== undefined) lines.push(`No remixlets exist for ${currentSite} yet.`);
-    const parked = onSite.filter((e) => e.state === "needs-attention");
-    if (parked.some((e) => e.attention === undefined)) {
+    if (onSite.some((e) => quarantined[e.id] !== undefined)) {
+      lines.push(
+        "A remixlet marked NOT RUNNING is switched on but the extension refused to run its stored files for the " +
+          "reason given. A new write_remixlet with the same id replaces the files and puts it back in service.",
+      );
+    }
+    if (onSite.some((e) => e.state === "needs-attention")) {
       lines.push(
         "A [needs-attention] remixlet was taken out of service automatically because its last change could not be " +
           "verified — it no longer runs on the page. A new write_remixlet with the same id activates the fix and " +
           "puts it back in service; consider offering the user to fix it.",
       );
     }
-    if (parked.some((e) => e.attention?.kind === "capability-revoked")) {
-      lines.push(
-        "A [needs-attention] remixlet was taken out of service because the user revoked a permission it was built " +
-          "to use — it no longer runs on the page. A new write_remixlet with the same id puts it back in service: " +
-          "either rewrite it to work without that permission, or declare the permission again (the user will be " +
-          "asked to approve it). Consider offering the user the fix.",
-      );
-    }
     if (elsewhere.length > 0) {
-      lines.push(`Other sites (ids in use, not candidates here): ${elsewhere.map((e) => `${e.id} on ${e.siteKey}`).join(", ")}.`);
+      lines.push(
+        `${elsewhere.length} remixlet${elsewhere.length === 1 ? "" : "s"} on other sites ${elsewhere.length === 1 ? "is" : "are"} not ` +
+          "listed here: not candidates for this page, and not readable from this chat; their ids are taken.",
+      );
     }
     return { text: lines.join("\n"), details: visible };
   },
@@ -424,6 +460,7 @@ interface ReadRemixletParams {
 
 function readRemixletTool(
   seenRemixletShas: Map<string, { sha: string; version: number; from: "read" | "write" }>,
+  tabs: TabBinding,
 ): AgentToolSpec<ReadRemixletParams> {
   return {
     name: "read_remixlet",
@@ -434,9 +471,24 @@ function readRemixletTool(
       "last saw it, the result says so briefly instead of repeating the files.",
     parameters: Type.Object({ id: Type.String() }),
     async execute(params) {
+      // The read is held to the chat's bound site: the worker returns only a
+      // remixlet that belongs to it (remediation plan item 7, cross-site
+      // reads), the same set list_remixlets lists in full. The record is
+      // panel-authored from the binding — nothing the model sends reaches
+      // it. An unbound chat binds here the way list_remixlets does, so the
+      // first read of a conversation is not refused for want of a site.
+      // Reading stored files touches no page, so a bound tab that has moved
+      // is not consulted: the site the chat works on is the site it was
+      // bound to, wherever the tab went.
+      if (tabs.bound === undefined) await tabs.target().catch(() => undefined);
+      const bound = tabs.bound;
+      const authorization = { siteKey: bound?.siteKey ?? "", tabId: bound?.tabId ?? -1 };
       // The files are always fetched in full — only the model-facing text is
       // shortened when nothing changed, so the result can never go stale.
-      const { files, headSha, version } = await sendToWorker({ kind: "remixlet.read", id: params.id }, "remixlet.content");
+      const { files, headSha, version } = await sendToWorker(
+        { kind: "remixlet.read", id: params.id, authorization },
+        "remixlet.content",
+      );
       let capabilities: string[] = [];
       try {
         // SAFETY: only the optional capabilities property is read from this local JSON metadata.
@@ -483,11 +535,11 @@ const readRemixletLogsTool: AgentToolSpec<ReadRemixletLogsParams> = {
   label: "Read remixlet logs",
   description:
     "The runtime log recorded from your remixlets' scripts since each one's last activation (bounded, most recent " +
-    "first): console.log/info/warn/error output, runtime exceptions, rmx.keep halt reasons and reapply notices, " +
+    "first): console output, runtime exceptions, refused page writes, rmx.keep halt reasons and reapply notices, " +
     "MutationObserver feedback-loop warnings, busy-page observer throttle notices (informational, not a defect), and " +
-    "denied capability calls. Only remixlet code is recorded — the host page's own console output is not. Check this " +
-    "whenever verification fails or a just-built feature misbehaves or seems inert — an empty result means nothing " +
-    "was recorded, not that the feature works.",
+    "denied capability calls. Only remixlet code is recorded, never the host page's own console. Check it whenever " +
+    "verification fails or a just-built feature misbehaves or seems inert; an empty result means nothing was " +
+    "recorded, not that the feature works.",
   parameters: Type.Object({
     id: Type.Optional(Type.String({ description: "Limit to one remixlet id; omit for all remixlets." })),
   }),
@@ -496,64 +548,26 @@ const readRemixletLogsTool: AgentToolSpec<ReadRemixletLogsParams> = {
     if (entries.length === 0) {
       return { text: "No runtime log entries recorded.", details: { count: 0 } };
     }
+    // The stored log is sized for a post-mortem (hundreds of entries per
+    // remixlet, durable across restarts); a fix turn needs the newest slice.
+    const shown = entries.slice(0, READ_REMIXLET_LOGS_MAX_LINES);
+    const omitted = entries.length - shown.length;
+    const lines = formatScriptLogLines(shown);
+    if (omitted > 0) {
+      lines.push(
+        `(${omitted} older ${omitted === 1 ? "entry" : "entries"} not shown` +
+          (params.id === undefined ? "; pass id to read one remixlet's log)" : ")"),
+      );
+    }
     return {
       // Log lines carry console output and error strings straight from the
       // page world, so the untrusted framing applies in full.
-      text: frameUntrustedPageData(formatScriptLogLines(entries).join("\n")),
+      text: frameUntrustedPageData(lines.join("\n")),
       provenance: "untrusted-page",
-      details: { count: entries.length },
+      details: { count: entries.length, shown: shown.length },
     };
   },
 };
-
-interface EvaluateParams {
-  code: string;
-}
-
-function evaluateJsTool(deps: ToolApprovalDeps, tabs: TabBinding): AgentToolSpec<EvaluateParams> {
-  return {
-    name: "evaluate_js",
-    label: "Evaluate in page",
-    description:
-      "ESCAPE HATCH — requires the user's explicit approval (a dialog offers to show them your code; they may " +
-      "approve one call or all calls for the chat). " +
-      "Runs a freeform JavaScript expression in the active tab (USER_SCRIPT sandbox — same world remixlets run in) and " +
-      "returns its JSON-serialized value. Prefer the structured probe tools (query_elements, inspect_element, " +
-      "inspect_design, read_structured_data, read_page_state, list_network_resources, replay_network_resource, " +
-      "click_element, assert_page_state) — they need no approval. Use this only when no probe can express " +
-      "the check. Not for making changes.",
-    parameters: Type.Object({
-      code: Type.String({ description: "An expression, e.g. document.querySelectorAll('.card').length" }),
-    }),
-    async execute(params) {
-      const { tabId, url, driftNotice } = await tabs.target();
-      let host = "";
-      try {
-        host = url === undefined ? "" : new URL(url).hostname;
-      } catch {
-        host = "";
-      }
-      // The gate: approval comes BEFORE anything crosses to the worker, so a
-      // declined script never reaches the page in any form.
-      const approved = await deps.confirmScriptEvaluation({ code: params.code, host });
-      if (!approved) {
-        throw new UserDeclinedError("The user declined running this script. Use the structured probe tools instead.");
-      }
-      const reply = await sendRaw({ kind: "page.evaluate", tabId, code: params.code });
-      if (reply.kind !== "page.evaluated") throw new Error(`unexpected reply ${reply.kind}`);
-      if (!reply.ok) throw new Error(reply.message);
-      return {
-        // The drift note is extension-authored steering — outside the framing.
-        text: frameUntrustedPageData(reply.value) + (driftNotice ? `\n\n${driftNotice}` : ""),
-        provenance: "untrusted-page",
-        // No verificationSucceeded here: a human-approved freeform script must
-        // not mint durable verification records — assert_page_state is the
-        // explicit lane (src/panel/verification.ts).
-        details: { url },
-      };
-    },
-  };
-}
 
 interface NavigateParams {
   url: string;
@@ -566,8 +580,8 @@ const navigateTool = (tabs: TabBinding): AgentToolSpec<NavigateParams> => ({
     "Drive the tab this conversation works on to an http(s) URL and wait for the load to finish (for verification loops).",
   parameters: Type.Object({ url: Type.String() }),
   async execute(params) {
-    const { tabId } = await tabs.target();
-    const reply = await sendRaw({ kind: "page.navigate", tabId, url: params.url });
+    const { tabId, page } = await tabs.target();
+    const reply = await sendRaw({ kind: "page.navigate", tabId, url: params.url, page });
     if (reply.kind !== "page.navigated") throw new Error(`unexpected reply ${reply.kind}`);
     if (!reply.ok) throw new Error(reply.message ?? "navigation failed");
     return { text: `Navigated to ${params.url}.`, details: undefined };

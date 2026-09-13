@@ -158,6 +158,8 @@ function PopupApp() {
   const [entries, setEntries] = useState<RegistryEntry[]>([]);
   const [commands, setCommands] = useState<MenuCommandSummary[]>([]);
   const [pausedKeys, setPausedKeys] = useState<string[]>([]);
+  // Enabled artifacts the worker refuses to run, id → reason.
+  const [quarantined, setQuarantined] = useState<Record<string, string>>({});
   const [capabilities, setCapabilities] = useState<PlatformCapabilities | null>(null);
   const [surfaceError, setSurfaceError] = useState("");
   const [refreshError, setRefreshError] = useState("");
@@ -179,6 +181,7 @@ function PopupApp() {
         : Promise.resolve({ kind: "menu.listed" as const, commands: [] }),
     ]);
     setEntries(listed.entries);
+    setQuarantined(listed.quarantined);
     setPausedKeys(paused.pausedSiteKeys);
     setCapabilities(caps.capabilities);
     setCommands(menu.commands);
@@ -211,11 +214,10 @@ function PopupApp() {
       });
   }, []);
 
-  // Onboarding gate: the SAME readiness the manager redirects on (scripts lane
-  // AND a usable provider) — not just the user-scripts capability. Gating on
-  // capabilities alone let the popup claim setup was done (scripts granted, no
-  // provider yet) while every other surface still sent people to welcome.html.
-  // Mirrors manager.tsx: a failed check counts as incomplete.
+  // Onboarding gate: the SAME readiness the manager redirects on (a usable
+  // provider), never a capability read — capabilities are what the browser
+  // gives, not what the user has to set up. Mirrors manager.tsx: a failed
+  // check counts as incomplete.
   useEffect(() => {
     void readSetupReadiness()
       .then((readiness) => setSetupIncomplete(!readiness.complete))
@@ -305,7 +307,7 @@ function PopupApp() {
   function openChat(): void {
     setSurfaceError("");
     void panelSurface()
-      .open(tab?.windowId, tab?.id)
+      .open(tab?.windowId)
       .then(() => window.close())
       .catch((cause: unknown) => setSurfaceError(`The panel could not open: ${String(cause)}`));
   }
@@ -368,6 +370,10 @@ function PopupApp() {
     // it "off" is a no-op (it already doesn't run). The label is the
     // explanation; fixing it in chat (or archiving it) is the way out.
     const needsAttention = entry.state === "needs-attention";
+    // Quarantined by the worker (unreadable files, invalid rules, bridge
+    // skew): the switch stays honest — the user did not turn it off — and the
+    // row says it is not running, with the reason in its tooltip.
+    const quarantine = entry.state === "enabled" ? quarantined[entry.id] : undefined;
     return (
       <div
         key={entry.id}
@@ -375,12 +381,15 @@ function PopupApp() {
         data-id={entry.id}
         data-paused={isPaused ? "true" : undefined}
         data-on-page={onPage ? "true" : undefined}
+        data-quarantined={quarantine !== undefined ? "true" : undefined}
         title={
           needsAttention
             ? "The last change to this remixlet couldn't be confirmed working, so it's off the page until it's fixed."
-            : elsewhere.length > 0
-              ? `Paused on ${elsewhere.join(", ")}`
-              : undefined
+            : quarantine !== undefined
+              ? `Not running: ${quarantine}. Update it from a chat, roll back to an earlier version, or delete it.`
+              : elsewhere.length > 0
+                ? `Paused on ${elsewhere.join(", ")}`
+                : undefined
         }
       >
         <span className="min-w-0 truncate text-sm leading-5">{entry.name}</span>
@@ -390,13 +399,20 @@ function PopupApp() {
           </span>
         ) : (
           /* The toggle stays live outside a site pause — enable/disable is the
-             remixlet's own switch, independent of which pages it matches. */
-          <Switch
-            className="remixlet-toggle"
-            checked={entry.state === "enabled"}
-            disabled={busy}
-            onCheckedChange={(checked) => toggleRemixlet(entry, checked)}
-          />
+             remixlet's own switch, independent of which pages it matches. A
+             quarantined row keeps it too (same treatment as the manager): the
+             label says it is not running, the switch is still the way off. */
+          <>
+            {quarantine !== undefined && (
+              <span className="remixlet-quarantined shrink-0 text-xs font-medium text-[var(--signal)]">Not running</span>
+            )}
+            <Switch
+              className="remixlet-toggle"
+              checked={entry.state === "enabled"}
+              disabled={busy}
+              onCheckedChange={(checked) => toggleRemixlet(entry, checked)}
+            />
+          </>
         )}
       </div>
     );
@@ -410,17 +426,10 @@ function PopupApp() {
       <div className="flex flex-col gap-4.5 rounded-xl bg-card p-4 shadow-[var(--ring-soft),var(--ring-1)]">
         <PopupHeader />
 
-        {capabilities && !capabilities.userScripts && (
-          <Alert variant="default" id="popup-userscripts-alert">
+        {capabilities && !capabilities.box && (
+          <Alert variant="default" id="popup-limited-mode-alert">
             <AlertTitle>JavaScript remixlets aren’t available</AlertTitle>
-            <AlertDescription>
-              {capabilities.disabledReasons.userScripts ?? capabilities.userScriptsDisabledReason}
-            </AlertDescription>
-            <AlertAction>
-              <Button type="button" variant="outline" size="sm" onClick={openOnboarding}>
-                Learn more
-              </Button>
-            </AlertAction>
+            <AlertDescription>{capabilities.disabledReasons.box}</AlertDescription>
           </Alert>
         )}
 
@@ -470,7 +479,7 @@ function PopupApp() {
                     {nothingRunsHere ? (
                       <>
                         <span aria-hidden className="size-1.5 flex-none rounded-full bg-[var(--signal)]" />
-                        Paused — nothing runs here
+                        Paused
                       </>
                     ) : onSite.length === 0 ? (
                       <span id="popup-empty">No remixlets yet, open the chat to start.</span>

@@ -7,6 +7,7 @@
 // validates what the user connected.
 
 import { PROVIDER_CATALOG, type ProviderKind } from "../agent/provider-catalog.js";
+import { isThinkingLevel, type ThinkingLevel } from "../agent/types.js";
 import { Type } from "typebox";
 import { Value } from "typebox/value";
 
@@ -24,6 +25,19 @@ const providerDefaults = Object.fromEntries(
 const PROVIDER_DEFAULTS = providerDefaults as Record<ProviderKind, ProviderDefaults>;
 export { PROVIDER_DEFAULTS };
 
+/**
+ * A model's reasoning dial as its provider declares it — for Codex, the
+ * manifest's per-model levels (already intersected with pi's vocabulary at
+ * discovery). Stored so the panel and runtime can offer/apply levels without
+ * re-fetching the manifest. Absent for providers whose support is derived
+ * from the pi catalog instead (agent/providers.ts supportedThinkingLevels).
+ */
+export interface ModelThinking {
+  levels: ThinkingLevel[];
+  /** What the backend applies when no level is sent — labels the "Default" choice. */
+  defaultLevel?: ThinkingLevel;
+}
+
 export interface ProviderConfig {
   id: string;
   kind: ProviderKind;
@@ -31,6 +45,8 @@ export interface ProviderConfig {
   baseUrl: string;
   apiKey: string;
   models: string[];
+  /** Reasoning-dial metadata per model id, for models whose provider declares one. */
+  modelThinking?: Record<string, ModelThinking>;
   /** When a request to this provider last succeeded — a chat turn or an
    *  explicit refresh. Never written on a schedule: the extension must not
    *  contact providers outside an active use. */
@@ -49,6 +65,23 @@ export interface ProviderSettings {
   version: 2;
   providers: ProviderConfig[];
   selectedModel: ModelSelection | null;
+  /**
+   * The user's chosen reasoning depth, keyed by thinkingLevelKey(). A model
+   * without an entry sends nothing and the backend applies its own default —
+   * so this map only ever holds deliberate choices.
+   */
+  thinkingLevels?: Record<string, ThinkingLevel>;
+}
+
+/** Storage key for one model's thinking-level choice. */
+export function thinkingLevelKey(selection: ModelSelection): string {
+  return `${selection.providerId}/${selection.modelId}`;
+}
+
+/** The chosen reasoning depth for the selected model, if the user set one. */
+export function selectedThinkingLevel(settings: ProviderSettings): ThinkingLevel | undefined {
+  if (!settings.selectedModel) return undefined;
+  return settings.thinkingLevels?.[thinkingLevelKey(settings.selectedModel)];
 }
 
 export interface AvailableModel extends ModelSelection {
@@ -85,9 +118,34 @@ function isProviderKind(value: string): value is ProviderKind {
 
 function uniqueModels(value: StoredValue | undefined): string[] {
   if (!Array.isArray(value)) return [];
-  return [...new Set(value.flatMap((model) => storedString(model)?.trim() ?? []))]
-    .filter(Boolean)
-    .sort((left, right) => left.localeCompare(right));
+  // Stored order is meaningful — discovery writes it (Codex: the manifest's
+  // own priority ranking; everyone else: alphabetical) and models[0] is the
+  // first-connect default — so dedupe without re-sorting.
+  return [...new Set(value.flatMap((model) => storedString(model)?.trim() ?? []))].filter(Boolean);
+}
+
+function normalizeModelThinking(value: StoredValue | undefined, models: string[]): Record<string, ModelThinking> | undefined {
+  if (value === undefined || !isStoredObject(value)) return undefined;
+  const thinking: Record<string, ModelThinking> = {};
+  for (const [modelId, entry] of Object.entries(value)) {
+    if (!models.includes(modelId) || !isStoredObject(entry) || !Array.isArray(entry.levels)) continue;
+    const levels = [
+      ...new Set(
+        entry.levels.flatMap((level) => {
+          const name = storedString(level);
+          return name !== undefined && isThinkingLevel(name) ? [name] : [];
+        }),
+      ),
+    ];
+    if (levels.length === 0) continue;
+    const item: ModelThinking = { levels };
+    const defaultLevel = storedString(entry.defaultLevel);
+    if (defaultLevel !== undefined && isThinkingLevel(defaultLevel) && levels.includes(defaultLevel)) {
+      item.defaultLevel = defaultLevel;
+    }
+    thinking[modelId] = item;
+  }
+  return Object.keys(thinking).length > 0 ? thinking : undefined;
 }
 
 function normalizeProvider(value: StoredValue): ProviderConfig | undefined {
@@ -97,7 +155,10 @@ function normalizeProvider(value: StoredValue): ProviderConfig | undefined {
   if (!kind || !isProviderKind(kind) || !id) return undefined;
   const defaults = PROVIDER_DEFAULTS[kind];
   const name = storedString(value.name)?.trim() || defaults.label;
-  const baseUrl = storedString(value.baseUrl)?.trim() || defaults.baseUrl;
+  // A Codex access token authorizes OpenAI's ChatGPT backend, not an
+  // arbitrary OpenAI-compatible endpoint. Pin it while normalizing so a
+  // corrupted store cannot move the bearer or account id to another origin.
+  const baseUrl = kind === "codex" ? defaults.baseUrl : storedString(value.baseUrl)?.trim() || defaults.baseUrl;
   const provider: ProviderConfig = {
     id,
     kind,
@@ -106,6 +167,8 @@ function normalizeProvider(value: StoredValue): ProviderConfig | undefined {
     apiKey: kind !== "codex" ? storedString(value.apiKey) ?? "" : "",
     models: uniqueModels(value.models),
   };
+  const modelThinking = normalizeModelThinking(value.modelThinking, provider.models);
+  if (modelThinking) provider.modelThinking = modelThinking;
   const lastUsedAt = storedString(value.lastUsedAt) ?? storedString(value.lastRefreshedAt);
   const lastError = storedString(value.lastError);
   if (lastUsedAt) provider.lastUsedAt = lastUsedAt;
@@ -152,48 +215,42 @@ function firstSelection(providers: ProviderConfig[]): ModelSelection | null {
   return provider && modelId ? { providerId: provider.id, modelId } : null;
 }
 
-/** Load the provider catalog and migrate the former single-provider shape. */
+/** Keep only choices that still point at a listed model and a real level. */
+function validThinkingLevels(
+  providers: ProviderConfig[],
+  value: StoredValue | undefined,
+): Record<string, ThinkingLevel> | undefined {
+  if (value === undefined || !isStoredObject(value)) return undefined;
+  const choices: Record<string, ThinkingLevel> = {};
+  for (const [key, stored] of Object.entries(value)) {
+    const level = storedString(stored);
+    if (level === undefined || !isThinkingLevel(level)) continue;
+    const slash = key.indexOf("/");
+    if (slash <= 0) continue;
+    const provider = providers.find((item) => item.id === key.slice(0, slash));
+    if (!provider?.models.includes(key.slice(slash + 1))) continue;
+    choices[key] = level;
+  }
+  return Object.keys(choices).length > 0 ? choices : undefined;
+}
+
+/**
+ * Load the provider catalog. Anything but the current shape reads as empty:
+ * there is no older shape to migrate from (pre-launch, no installed users).
+ */
 export function normalizeProviderSettings(stored: StoredValue): ProviderSettings {
   if (!isStoredObject(stored)) return { ...DEFAULT_SETTINGS, providers: [] };
   const raw = stored;
-
-  if (raw.version === 2 && Array.isArray(raw.providers)) {
-    const providers = raw.providers.map(normalizeProvider).filter((item): item is ProviderConfig => item !== undefined);
-    return {
-      version: 2,
-      providers,
-      selectedModel: validSelection(providers, raw.selectedModel) ?? firstSelection(providers),
-    };
-  }
-
-  // v1 stored exactly one API-key or Codex provider. Preserve its endpoint,
-  // credential, and selected model while moving it into the catalog.
-  const mode = raw.mode === "codex" ? "codex" : "api-key";
-  const storedProvider = storedString(raw.provider);
-  const legacyKind: ProviderKind =
-    mode === "codex" ? "codex" : storedProvider && isProviderKind(storedProvider) && storedProvider !== "codex" ? storedProvider : "remixlet";
-  const defaults = PROVIDER_DEFAULTS[legacyKind];
-  const storedModelId = storedString(mode === "codex" ? raw.codexModelId : raw.modelId)?.trim();
-  const modelId = storedModelId ?? "";
-  const storedBaseUrl = storedString(mode === "codex" ? raw.codexBaseUrl : raw.baseUrl)?.trim();
-  const baseUrl = storedBaseUrl || defaults.baseUrl;
-  const apiKey = mode === "api-key" ? storedString(raw.apiKey) ?? "" : "";
-  const hasLegacyProvider = modelId.length > 0 || apiKey.length > 0;
-  if (!hasLegacyProvider) return { ...DEFAULT_SETTINGS, providers: [] };
-
-  const provider: ProviderConfig = {
-    id: `migrated-${legacyKind}`,
-    kind: legacyKind,
-    name: defaults.label,
-    baseUrl,
-    apiKey,
-    models: modelId ? [modelId] : [],
-  };
-  return {
+  if (raw.version !== 2 || !Array.isArray(raw.providers)) return { ...DEFAULT_SETTINGS, providers: [] };
+  const providers = raw.providers.map(normalizeProvider).filter((item): item is ProviderConfig => item !== undefined);
+  const settings: ProviderSettings = {
     version: 2,
-    providers: [provider],
-    selectedModel: modelId ? { providerId: provider.id, modelId } : null,
+    providers,
+    selectedModel: validSelection(providers, raw.selectedModel) ?? firstSelection(providers),
   };
+  const thinkingLevels = validThinkingLevels(providers, raw.thinkingLevels);
+  if (thinkingLevels) settings.thinkingLevels = thinkingLevels;
+  return settings;
 }
 
 export function availableModels(settings: ProviderSettings): AvailableModel[] {
@@ -234,6 +291,7 @@ export function providerUsable(provider: ProviderConfig): boolean {
 export function providerRuntimeFingerprint(settings: ProviderSettings): string {
   return JSON.stringify({
     selected: settings.selectedModel,
+    thinking: settings.thinkingLevels ?? {},
     providers: settings.providers.map(({ lastUsedAt: _at, lastError: _err, ...rest }) => rest),
   });
 }

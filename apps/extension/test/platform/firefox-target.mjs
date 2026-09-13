@@ -30,13 +30,16 @@ assert(manifest.background?.service_worker === undefined, "Firefox manifest does
 assert(manifest.background?.type === "module", "Firefox background script is loaded as a module");
 assert(manifest.sidebar_action?.default_panel === "panel/index.html", "shared panel is exposed as a Firefox sidebar");
 assert(manifest.side_panel === undefined, "Chrome side_panel key is absent");
-assert(optionalPermissions.has("userScripts"), "Firefox requests userScripts as an optional permission");
-assert(!permissions.has("userScripts"), "Firefox does not install-grant userScripts");
+assert(!optionalPermissions.has("userScripts") && !permissions.has("userScripts"), "Firefox asks for no userScripts permission");
+assert(
+  permissions.has("declarativeNetRequest") && !permissions.has("declarativeNetRequestWithHostAccess"),
+  "Firefox keeps plain declarativeNetRequest: its host permissions are optional-by-default, so the WithHostAccess variant would leave netrules and the OAuth redirect inert until the user opts in per site",
+);
 assert(!permissions.has("clipboardWrite"), "unsupported clipboard authority is absent");
 assert(permissions.has("webRequestBlocking"), "response stream interception has its Firefox permission");
 assert(permissions.has("webRequestFilterResponse"), "MV3 response filtering has its Firefox permission");
 assert(!optionalPermissions.has("pageCapture"), "Chrome MHTML escalation is absent");
-assert(worker.includes("firefox-user-scripts"), "Firefox ScriptInjector backend is bundled");
+assert(worker.includes("JavaScript remixlets are unavailable in Firefox"), "Firefox names why the box cannot run (no offscreen document)");
 assert(worker.includes("Firefox capture is limited to the visible viewport"), "Firefox capture degradation is explicit");
 assert(worker.includes('BROWSER_TARGET === "chrome"'), "DNR OAuth redirect remains Chrome-selected");
 assert(worker.includes("clipboard is unavailable because Firefox"), "unsupported clipboard activation is explicit");
@@ -45,7 +48,7 @@ assert(
     worker.includes('MIN_SCHEDULE_INTERVAL_MINUTES = BROWSER_TARGET === "chrome" ? 0.5 : 1'),
   "Firefox rejects repeating schedules below its one-minute alarm floor",
 );
-assert(panel.includes("userScriptsSetup"), "panel distinguishes Firefox setup from target-unavailable mode");
+assert(panel.includes("limited-mode-alert"), "panel shows the limited-mode reason where the box is unavailable");
 assert(popup.includes("popup-panel-error"), "sidebar open failures render visibly");
 await assertTargetCapabilityGates("firefox");
 

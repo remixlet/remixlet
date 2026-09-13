@@ -7,8 +7,7 @@
 //
 // Setup is a gate in front of all of it. Readiness is computed from facts on
 // load (ui/onboarding/readiness.ts) — never a "has seen onboarding" flag — so
-// a revoked user-scripts toggle or a deleted last provider closes this
-// surface again. Unfinished setup never renders the sidebar at all: the
+// a deleted last provider closes this surface again. Unfinished setup never renders the sidebar at all: the
 // document redirects to the standalone welcome page instead.
 
 import { useEffect, useState } from "react";
@@ -57,6 +56,9 @@ function PlatformLimitations({ capabilities }: { capabilities: PlatformCapabilit
 function ControlCenterApp() {
   const route = useRoute();
   const [entries, setEntries] = useState<RegistryEntry[] | undefined>(undefined);
+  // Enabled artifacts the worker refuses to run, id → reason. Not a registry
+  // state: the switch still says on; the worker could not admit the files.
+  const [quarantined, setQuarantined] = useState<Record<string, string>>({});
   const [pausedKeys, setPausedKeys] = useState<string[]>([]);
   const [siteIcons, setSiteIcons] = useState<Record<string, string> | undefined>(undefined);
   const [capabilities, setCapabilities] = useState<PlatformCapabilities | null>(null);
@@ -69,6 +71,7 @@ function ControlCenterApp() {
       send({ kind: "capabilities.get" }, "capabilities.result"),
     ]);
     setEntries(listed.entries);
+    setQuarantined(listed.quarantined);
     setPausedKeys(paused.pausedSiteKeys);
     setSiteIcons(icons.icons);
     setCapabilities(caps.capabilities);
@@ -95,7 +98,7 @@ function ControlCenterApp() {
     case "remixlet": {
       const entry = entries?.find((candidate) => candidate.id === route.id);
       content = entry ? (
-        <RemixletPage key={entry.id} entry={entry} siteIcons={siteIcons} onChanged={refresh} />
+        <RemixletPage key={entry.id} entry={entry} quarantine={quarantined[entry.id]} siteIcons={siteIcons} onChanged={refresh} />
       ) : entries === undefined ? (
         <p className="text-sm text-muted-foreground">Loading…</p>
       ) : (
@@ -106,7 +109,7 @@ function ControlCenterApp() {
       break;
     }
     default:
-      content = <DashboardPage entries={entries} siteIcons={siteIcons} />;
+      content = <DashboardPage entries={entries} quarantined={quarantined} siteIcons={siteIcons} />;
   }
 
   return (
@@ -132,11 +135,9 @@ function ControlCenterApp() {
  *
  * And it keeps watch: the control center is a hash-routed SPA in ONE
  * document, so mount is the only free re-check — a tab that outlives the
- * "Allow user scripts" grant would otherwise stay open forever on an install
- * that no longer works. Every route change re-asks (readiness verifies with
- * a real API call, which is what catches a revoked grant in a context that
- * still holds the namespace) and diverts to setup the moment the answer
- * turns false.
+ * last provider would otherwise stay open forever on an install that no
+ * longer works. Every route change re-asks and diverts to setup the moment
+ * the answer turns false.
  */
 function ControlCenterRoot() {
   const [allowed, setAllowed] = useState(false);

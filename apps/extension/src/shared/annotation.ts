@@ -29,8 +29,8 @@ export const ANNOTATE_CLEAR_MESSAGE = "remixlet.annotate.clear";
 
 /**
  * Runtime message kind the overlay broadcasts when the user finishes (Done,
- * Cancel, or Escape). Both extension sides listen: the worker restores the
- * drawer it hid, the panel takes the payload as a pending attachment.
+ * Cancel, or Escape). Both extension sides listen: the worker acknowledges,
+ * the panel takes the payload as a pending attachment.
  */
 export const ANNOTATION_RESULT_KIND = "annotation.result";
 

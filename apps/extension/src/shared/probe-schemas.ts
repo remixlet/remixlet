@@ -33,7 +33,6 @@ const AssertConditionSchema = Type.Union([
   Type.Literal("attr-equals"),
   Type.Literal("style-equals"),
   Type.Literal("style-parity"),
-  Type.Literal("design-parity"),
   Type.Literal("visible"),
   Type.Literal("not-clipped"),
 ]);
@@ -127,15 +126,32 @@ export const ReadStructuredDataParams = Type.Object({
 export type ReadStructuredDataParamsType = Static<typeof ReadStructuredDataParams>;
 
 export const ListNetworkResourcesParams = Type.Object({
-  urlFilter: Type.Optional(Type.String({ description: "Substring filter applied to resource URLs." })),
+  urlFilter: Type.Optional(
+    Type.String({
+      minLength: 1,
+      maxLength: 500,
+      description:
+        "Substring that narrows the listing by host or path, matched against each request's host + path shape as " +
+        "the capture shows them (api-v2.soundcloud.com, /stream, /tracks/:n) and against the real path.",
+    }),
+  ),
+  search: Type.Optional(
+    Type.Union([Type.String({ minLength: 1, maxLength: 200 }), Type.Number()], {
+      description:
+        "A value you can see rendered (a duration, a price). The newest call of up to 8 endpoint groups is " +
+        "replayed (GET, the page's own cookies) and each response body is searched for it; the reply lists the " +
+        "endpoints with the JSON paths that matched. Combine with urlFilter to choose which endpoints get replayed.",
+    }),
+  ),
   limit: Type.Optional(
-    Type.Integer({ minimum: 1, maximum: 200, description: "Max endpoints (or rows with flat) to return (default 50)." }),
+    Type.Integer({ minimum: 1, maximum: 200, description: "Max endpoint groups (or calls with flat) to return (default 15)." }),
   ),
   flat: Type.Optional(
     Type.Boolean({
       description:
-        "List every data request as its own row (url, contentType, status) instead of the default endpoint " +
-        "grouping. Reach for it only when individual requests matter — e.g. comparing repeated calls to one endpoint.",
+        "List every data request as its own row with its own id (host, path shape, status, size) instead of the " +
+        "endpoint grouping. Reach for it only when individual requests matter, e.g. comparing repeated calls to " +
+        "one endpoint.",
     }),
   ),
   includeAssets: Type.Optional(
@@ -173,14 +189,43 @@ export const ClickElementParams = Type.Object({
 });
 export type ClickElementParamsType = Static<typeof ClickElementParams>;
 
+/**
+ * How much of the surrounding page a look-review crop includes
+ * (wiki/raw/handoffs/2026-09-03-look-review-crops.md §1): "row" is the
+ * nearest ancestor wide enough to be the element's row, "container" the
+ * nearest painted (background or border) ancestor, "element" the element's
+ * own box.
+ */
+export const LookContextSchema = Type.Union([Type.Literal("row"), Type.Literal("container"), Type.Literal("element")], {
+  description:
+    'How much surrounding page each crop includes: "row" (default) the nearest ancestor at least three times as ' +
+    'wide as the element, "container" the nearest ancestor with a painted background or border, "element" the ' +
+    "element's own box.",
+});
+export type LookContext = Static<typeof LookContextSchema>;
+
+/**
+ * The page-side half of look_at_change: bring the added element (and the host
+ * exemplar) into view and report the rectangles the worker crops. Never a
+ * verdict — the crops are judged by the model, the geometry only says where
+ * to cut.
+ */
+export const LocateForReviewParams = Type.Object({
+  selector: Selector,
+  referenceSelector: Type.Optional(Selector),
+  context: Type.Optional(LookContextSchema),
+});
+export type LocateForReviewParamsType = Static<typeof LocateForReviewParams>;
+
 export const ReplayNetworkResourceParams = Type.Object({
-  url: Type.String({
-    minLength: 1,
-    maxLength: 2000,
+  id: Type.String({
+    pattern: "^r[1-9][0-9]*$",
+    maxLength: 12,
     description:
-      "The exact URL to re-request. It executes ONLY if this exact URL already appears in the page's own " +
-      "resource timeline (checked in-page at execution time) — the probe can re-issue a GET the page already " +
-      "made, never a fabricated one.",
+      "The id of the request to re-issue, as listed in the capture's Data endpoints section or by " +
+      "list_network_resources (r12). An endpoint group's id replays its newest call. The extension resolves the " +
+      "id to the URL it recorded from this page load; an id from an earlier load or one never listed is refused " +
+      "without a request.",
   }),
   maxBytes: Type.Optional(
     Type.Integer({ minimum: 256, maximum: 65_536, description: "Response-body budget in characters (default 16384)." }),
@@ -225,8 +270,7 @@ export const PageAssertion = Type.Object({
   otherSelector: Type.Optional(
     Type.String({
       minLength: 1,
-      description:
-        "Second selector for style-parity/design-parity: the reference element to compare against (e.g. the host's own control).",
+      description: "Second selector for style-parity: the reference element to compare against (e.g. the host's own control).",
     }),
   ),
 });
@@ -239,9 +283,9 @@ export const AssertPageStateParams = Type.Object({
       minimum: 0,
       maximum: 10_000,
       description:
-        'Retry window in milliseconds (cap 10000): "assert within N ms" — all assertions are re-evaluated together ' +
-        'until every one passes or the window lapses, and the final per-assertion results are returned either way. ' +
-        'Omit for "assert now". Use it on the first assert after a reload when content loads late.',
+        "Retry window in milliseconds (cap 10000): all assertions re-evaluate together until every one passes or the " +
+        "window lapses, and the final per-assertion results come back either way. Omit to evaluate once; use it when " +
+        "what you assert is content the page itself loads late.",
     }),
   ),
 });
@@ -259,6 +303,7 @@ export const PROBE_SCHEMAS = {
   observe_network_bodies: ObserveNetworkBodiesParams,
   click_element: ClickElementParams,
   assert_page_state: AssertPageStateParams,
+  locate_for_review: LocateForReviewParams,
 } satisfies Record<string, TSchema>;
 
 export type ProbeName = keyof typeof PROBE_SCHEMAS;
@@ -288,8 +333,8 @@ export function isProbeName(value: string): value is ProbeName {
  * whose schemas predate the panel's tool specs rejects params the panel was
  * told are valid, and without this check that surfaces as an opaque schema
  * error the agent can only retry against (the soundcloud-mix-filter session:
- * 13 identical assert_page_state rejections because the worker predated
- * "design-parity"). Returns the failure message when the two bundles carry
+ * 13 identical assert_page_state rejections because the worker predated a
+ * newly added assert condition). Returns the failure message when the two bundles carry
  * different build stamps — a MISSING stamp is a mismatch too, fail closed —
  * and undefined when they agree.
  */

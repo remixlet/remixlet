@@ -31,6 +31,8 @@ export interface PrivilegedFetchResult {
   statusText: string;
   headers: [string, string][];
   content: string;
+  /** Present only for a lane that explicitly requests binary bytes. */
+  bytes?: Uint8Array;
   redirected: boolean;
 }
 
@@ -75,12 +77,28 @@ interface ParsedOptions {
   timeoutMs: number;
 }
 
+/**
+ * How a caller's requests are sent. rmx.fetch uses the defaults (the user's
+ * cookies, the full response cap); the probe stylesheet lane below narrows
+ * both.
+ */
+interface FetchLane {
+  credentials: RequestCredentials;
+  maxResponseBytes: number;
+  responseType?: "text" | "bytes";
+  authorityLabel?: string;
+}
+
+const DEFAULT_LANE: FetchLane = { credentials: "include", maxResponseBytes: FETCH_RESPONSE_MAX_BYTES };
+
 export async function privilegedFetch(
   request: PrivilegedFetchRequest,
   isAllowed: (url: URL) => boolean,
+  lane: FetchLane = DEFAULT_LANE,
 ): Promise<PrivilegedFetchResult> {
   const initialUrl = parseUrl(request.url);
-  if (!isAllowed(initialUrl)) throw new Error("URL is outside the granted fetch host patterns");
+  const authorityLabel = lane.authorityLabel ?? "the granted fetch host patterns";
+  if (!isAllowed(initialUrl)) throw new Error(`URL is outside ${authorityLabel}`);
   const options = parseOptions(request.options);
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), options.timeoutMs);
@@ -92,11 +110,11 @@ export async function privilegedFetch(
   let redirected = false;
   try {
     for (let redirectCount = 0; ; redirectCount += 1) {
-      const hop = await fetchOneHop(url, method, headers, body, controller);
+      const hop = await fetchOneHop(url, method, headers, body, controller, lane.credentials);
       if ("redirectUrl" in hop) {
         if (redirectCount >= FETCH_MAX_REDIRECTS) throw new Error("too many redirects");
         const nextUrl = parseUrl(hop.redirectUrl);
-        if (!isAllowed(nextUrl)) throw new Error("redirect escaped the granted fetch host patterns");
+        if (!isAllowed(nextUrl)) throw new Error(`redirect escaped ${authorityLabel}`);
         redirected = true;
         if (nextUrl.origin !== url.origin) {
           headers = new Headers(headers);
@@ -118,13 +136,19 @@ export async function privilegedFetch(
       }
 
       const response = hop.response;
-      const content = method === "HEAD" ? "" : await readBoundedText(response, controller.signal);
+      let content = "";
+      let bytes: Uint8Array | undefined;
+      if (method !== "HEAD") {
+        if (lane.responseType === "bytes") bytes = await readBoundedBytes(response, controller.signal, lane.maxResponseBytes);
+        else content = await readBoundedText(response, controller.signal, lane.maxResponseBytes);
+      }
       return {
         url: response.url || url.href,
         status: response.status,
         statusText: response.statusText,
         headers: safeResponseHeaders(response.headers),
         content,
+        bytes,
         redirected,
       };
     }
@@ -145,6 +169,7 @@ async function fetchOneHop(
   headers: Headers,
   body: string | undefined,
   controller: AbortController,
+  credentials: RequestCredentials,
 ): Promise<{ response: Response } | { redirectUrl: string; statusCode: number }> {
   let redirect: { redirectUrl: string; statusCode: number } | undefined;
   let resolveRedirect: (() => void) | undefined;
@@ -165,7 +190,7 @@ async function fetchOneHop(
         method,
         headers,
         body,
-        credentials: "include",
+        credentials,
         redirect: "error",
         cache: "no-store",
         signal: controller.signal,
@@ -253,13 +278,17 @@ function parseOptions(value: FetchInput | undefined): ParsedOptions {
   return { method, headers, body, timeoutMs };
 }
 
-async function readBoundedText(response: Response, signal: AbortSignal): Promise<string> {
+async function readBoundedText(response: Response, signal: AbortSignal, maxBytes: number): Promise<string> {
+  return new TextDecoder().decode(await readBoundedBytes(response, signal, maxBytes));
+}
+
+async function readBoundedBytes(response: Response, signal: AbortSignal, maxBytes: number): Promise<Uint8Array> {
   const declaredLength = response.headers.get("content-length");
-  if (declaredLength !== null && Number(declaredLength) > FETCH_RESPONSE_MAX_BYTES) {
+  if (declaredLength !== null && Number(declaredLength) > maxBytes) {
     await response.body?.cancel().catch(() => {});
-    throw new Error(`fetch response exceeds ${FETCH_RESPONSE_MAX_BYTES} bytes`);
+    throw new Error(`fetch response exceeds ${maxBytes} bytes`);
   }
-  if (response.body === null) return "";
+  if (response.body === null) return new Uint8Array();
 
   const reader = response.body.getReader();
   const chunks: Uint8Array[] = [];
@@ -275,9 +304,9 @@ async function readBoundedText(response: Response, signal: AbortSignal): Promise
       }
       if (part.done) break;
       total += part.value.byteLength;
-      if (total > FETCH_RESPONSE_MAX_BYTES) {
+      if (total > maxBytes) {
         await reader.cancel().catch(() => {});
-        throw new Error(`fetch response exceeds ${FETCH_RESPONSE_MAX_BYTES} bytes`);
+        throw new Error(`fetch response exceeds ${maxBytes} bytes`);
       }
       chunks.push(part.value);
     }
@@ -290,9 +319,89 @@ async function readBoundedText(response: Response, signal: AbortSignal): Promise
     bytes.set(chunk, offset);
     offset += chunk.byteLength;
   }
-  return new TextDecoder().decode(bytes);
+  return bytes;
 }
 
 function safeResponseHeaders(headers: Headers): [string, string][] {
   return [...headers.entries()].filter(([name]) => name !== "set-cookie" && name !== "set-cookie2");
+}
+
+export const PROBE_STYLESHEET_MAX_BYTES = 1024 * 1024;
+const PROBE_STYLESHEET_TIMEOUT_MS = 10_000;
+export const PAGE_ICON_MAX_BYTES = 256 * 1024;
+const PAGE_ASSET_TIMEOUT_MS = 10_000;
+const PAGE_HTML_MAX_BYTES = 256 * 1024;
+
+function exactPageOrigin(pageOrigin: string): string {
+  let parsed: URL;
+  try {
+    parsed = new URL(pageOrigin);
+  } catch {
+    throw new Error("page origin is invalid");
+  }
+  if ((parsed.protocol !== "http:" && parsed.protocol !== "https:") || parsed.origin !== parsed.href.replace(/\/$/, "")) {
+    throw new Error("page origin must contain only an HTTP(S) origin");
+  }
+  return parsed.origin;
+}
+
+interface PageOriginLane {
+  origin: string;
+  lane: FetchLane;
+}
+
+function pageOriginLane(pageOrigin: string, responseType: "text" | "bytes", maxResponseBytes: number): PageOriginLane {
+  return {
+    origin: exactPageOrigin(pageOrigin),
+    lane: {
+      credentials: "omit",
+      maxResponseBytes,
+      responseType,
+      authorityLabel: "the page origin",
+    },
+  };
+}
+
+/** Fetch the page's public HTML for icon discovery, without leaving its exact origin. */
+export async function fetchPageHtml(pageOrigin: string): Promise<PrivilegedFetchResult> {
+  const { origin, lane } = pageOriginLane(pageOrigin, "text", PAGE_HTML_MAX_BYTES);
+  return privilegedFetch(
+    { url: `${origin}/`, options: { method: "GET", timeoutMs: PAGE_ASSET_TIMEOUT_MS } },
+    (url) => url.origin === origin,
+    lane,
+  );
+}
+
+/** Fetch favicon bytes without cookies, redirects off-origin, or buffering past 256 KiB. */
+export async function fetchPageIcon(href: string, pageOrigin: string): Promise<PrivilegedFetchResult & { bytes: Uint8Array }> {
+  const { origin, lane } = pageOriginLane(pageOrigin, "bytes", PAGE_ICON_MAX_BYTES);
+  const result = await privilegedFetch(
+    { url: href, options: { method: "GET", timeoutMs: PAGE_ASSET_TIMEOUT_MS } },
+    (url) => url.origin === origin,
+    lane,
+  );
+  if (result.bytes === undefined) throw new Error("icon response bytes are missing");
+  return { ...result, bytes: result.bytes };
+}
+
+/**
+ * The probe-only stylesheet lane (wiki/design/inspect-probes.md): one GET of
+ * a stylesheet URL the page's document.styleSheets listed, sent without
+ * cookies, accepted only as a 200 text/css body under the cap. The model
+ * never chooses the URL (the inspect_design probe reads it from the page) and
+ * never sees the body (the worker feeds it back into the probe's state-rule
+ * scan). Every request and redirect remains on the inspected page's exact
+ * origin.
+ */
+export async function fetchProbeStylesheet(href: string, pageOrigin: string): Promise<string> {
+  const { origin, lane } = pageOriginLane(pageOrigin, "text", PROBE_STYLESHEET_MAX_BYTES);
+  const result = await privilegedFetch(
+    { url: href, options: { method: "GET", timeoutMs: PROBE_STYLESHEET_TIMEOUT_MS } },
+    (url) => url.origin === origin,
+    lane,
+  );
+  if (result.status !== 200) throw new Error(`stylesheet responded ${result.status}`);
+  const contentType = result.headers.find(([name]) => name === "content-type")?.[1] ?? "";
+  if (!/^\s*text\/css\s*(?:;|$)/i.test(contentType)) throw new Error(`stylesheet is not text/css (${contentType || "no content-type"})`);
+  return result.content;
 }

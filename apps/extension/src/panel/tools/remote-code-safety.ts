@@ -141,7 +141,8 @@ function reviewFile(program: AstNode, path: string): RemoteCodeFinding[] {
     //    primitive. `document.createElement("script")`.
     if (node.type === "CallExpression" || node.type === "OptionalCallExpression") {
       const callee = isNode(node.callee) ? node.callee : undefined;
-      if (memberProperty(callee) === "createElement") {
+      // Both the raw DOM name and the box's dom.create verb.
+      if (memberProperty(callee) === "createElement" || memberProperty(callee) === "create") {
         const arg = Array.isArray(node.arguments) ? node.arguments.find(isNode) : undefined;
         if (staticString(arg)?.toLowerCase() === "script") {
           add(node, "creates a <script> element. A remixlet cannot inject scripts — that would let it run code it did not ship.");
